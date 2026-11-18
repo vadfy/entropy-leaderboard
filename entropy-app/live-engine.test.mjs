@@ -544,14 +544,22 @@ test('two repeated audit timeouts split the stalled window and minimum gaps allo
 });
 
 const queryLane = query => query.startsWith('@entropyIO') ? 'direct' : query.startsWith('Entropy ') ? 'context' : 'evidence';
-test('one reserved hourly request plans three independent query lanes without claiming broader completion', async () => {
+test('each explicit hourly first page plans only its selected query lane and retains independent success', async () => {
   const calls = [];
-  const result = await advanceHourlyDiscovery(wb(data([], [])), { now: START, client: client(async args => { calls.push(args); return emptyPage(); }) });
+  const provider = client(async args => { calls.push(args); return emptyPage(); });
+  let result = await advanceHourlyDiscovery(wb(data([], [])), { now: START, client: provider });
   assert.equal(calls.length, 1); assert.equal(queryLane(calls[0].query), 'direct');
+  assert.equal(result.sync.hourly.lanes.evidence.latestPlannedThrough, null);
+  assert.equal(result.sync.hourly.lanes.context.latestPlannedThrough, null);
+  assert.equal(result.sync.hourly.lanes.evidence.latestSuccessAt, null);
+  assert.equal(result.sync.hourly.lanes.context.latestSuccessAt, null);
+  for (const [index, discoveryLane] of ['evidence', 'context'].entries()) result = await advanceHourlyDiscovery(result, { now: new Date(Date.parse(START) + (index + 1) * 6000).toISOString(), discoveryLane, client: provider });
+  assert.deepEqual(calls.map(call => queryLane(call.query)), DISCOVERY_LANES);
   for (const lane of DISCOVERY_LANES) {
     const state = result.sync.hourly.lanes[lane], windows = result.sync.hourly.pendingWindows.filter(window => window.discoveryLane === lane);
-    assert.equal(state.latestPlannedThrough, START);
-    assert.equal(state.lastSuccessAt, lane === 'direct' ? START : null);
+    const at = new Date(Date.parse(START) + DISCOVERY_LANES.indexOf(lane) * 6000).toISOString();
+    assert.equal(state.latestPlannedThrough, at); assert.equal(state.latestSuccessAt, at);
+    assert.equal(state.lastSuccessAt, at); assert.equal(state.latestNextRunAt, '2026-11-17T13:00:00.000Z');
     assert.equal(state.completedThrough, null);
     assert.ok(windows.some(window => window.audit));
     for (const window of windows) {
@@ -559,8 +567,9 @@ test('one reserved hourly request plans three independent query lanes without cl
       assert.ok(window.query.length <= 512); assert.equal(window.cursor, '');
     }
   }
-  assert.equal(result.sync.hourly.lanes.evidence.completedRanges.length, 0);
-  assert.equal(result.sync.hourly.lanes.context.completedRanges.length, 0);
+  assert.equal(result.sync.hourly.lastSuccessAt, START); assert.equal(result.sync.hourly.latestWindow.discoveryLane, 'direct');
+  assert.equal(result.sync.hourly.lanes.evidence.completedRanges.length, 1);
+  assert.equal(result.sync.hourly.lanes.context.completedRanges.length, 1);
 });
 test('fair maintenance visits broad lanes while a noisy context cursor cannot take the next direct hourly slot', async () => {
   const calls = []; let page = 0;
@@ -583,7 +592,7 @@ test('cross-lane observations deduplicate one work and retain compact official e
   const source = hourTweet('8800', undefined, { text: '@entropyIO docs https://entropy.io/', entities: { urls: [{ expanded_url: 'https://entropy.io/' }] } });
   const provider = client(async () => ({ tweets: [source], hasNextPage: false, nextCursor: null }));
   let result = await advanceHourlyDiscovery(wb(data([], [])), { now: START, client: provider });
-  for (let index = 0; index < 4; index++) result = await advanceHourlyDiscovery(result, { now: result.sync.hourly.nextAttemptAt, lane: 'catchup', client: provider });
+  for (const discoveryLane of ['evidence', 'context']) result = await advanceHourlyDiscovery(result, { now: result.sync.hourly.nextAttemptAt, discoveryLane, client: provider });
   assert.equal(result.dataset.posts.length, 1);
   assert.deepEqual([...result.dataset.posts[0].discoveryLanes].sort(), ['context', 'direct', 'evidence']);
   assert.equal(result.dataset.posts[0].relevance.status, 'accepted');
@@ -649,4 +658,162 @@ test('dense context audits cannot monopolize the old-work slot of other query la
   const oldSlots = [calls[6], calls[12], calls[18]];
   assert.deepEqual(oldSlots.map(call => call.lane), ['direct', 'evidence', 'context']);
   assert.ok(oldSlots.every(call => call.from < Date.parse(START) / 1000 - 48 * 3600));
+});
+
+test('all three hourly first pages bypass old cursors and maintenance backoff, including untagged posts', async () => {
+  const from = '2026-11-10T00:00:00Z', until = '2026-11-11T00:00:00Z';
+  const pendingWindows = DISCOVERY_LANES.map(discoveryLane => frozenWindow(from, until, { id: 'old-' + discoveryLane, discoveryLane,
+    query: discoveryQuery(from, until, DISCOVERY_QUERY_POLICY, discoveryLane), cursor: 'old-' + discoveryLane, seenCursors: ['old-' + discoveryLane] }));
+  const lanes = Object.fromEntries(DISCOVERY_LANES.map(discoveryLane => [discoveryLane, { latestPlannedThrough: until, lastSuccessAt: '2026-11-16T10:00:00Z' }]));
+  let result = wb(data([], []), { hourly: hourlyState({ lanes, pendingWindows, catchupRequestCount: 5, nextAttemptAt: '2026-11-17T13:45:00Z' }) });
+  const calls = [], bodies = ['@entropyIO creator update', 'Entropy docs https://entropy.io/', 'Entropy HIP-3 perpetual markets on Hyperliquid'];
+  const provider = client(async args => {
+    calls.push(args); const discoveryLane = queryLane(args.query), index = DISCOVERY_LANES.indexOf(discoveryLane);
+    assert.equal(args.cursor, ''); assert.ok(Number(args.query.match(/since_time:(\d+)/)[1]) >= Date.parse('2026-11-17T10:55:00Z') / 1000);
+    return { tweets: [hourTweet(String(92000 + index), '2026-11-17T11:50:00Z', { text: bodies[index] }),
+      hourTweet(String(93000 + index), '2026-11-17T11:50:00Z', { text: bodies[index], isReply: true })], hasNextPage: true, nextCursor: 'fresh-' + discoveryLane };
+  });
+  for (const [index, discoveryLane] of DISCOVERY_LANES.entries()) result = await advanceHourlyDiscovery(result, { now: new Date(Date.parse(START) + index * 6000).toISOString(), discoveryLane, client: provider });
+  assert.deepEqual(calls.map(call => queryLane(call.query)), DISCOVERY_LANES);
+  assert.deepEqual(result.dataset.posts.map(post => post.id).sort(), ['92000', '92001', '92002']);
+  assert.ok(result.dataset.posts.every(post => post.relevance.status === 'accepted' && !post.isReply));
+  assert.equal(result.sync.hourly.latestPages, 3); assert.equal(result.sync.hourly.catchupRequestCount, 5);
+  assert.equal(result.sync.hourly.lastSuccessAt, START); assert.equal(result.sync.nextRunAt, '2026-11-17T13:00:00.000Z');
+  for (const discoveryLane of DISCOVERY_LANES) {
+    assert.equal(result.sync.hourly.pendingWindows.find(window => window.id === 'old-' + discoveryLane).cursor, 'old-' + discoveryLane);
+    assert.ok(result.sync.hourly.pendingWindows.some(window => window.discoveryLane === discoveryLane && window.cursor === 'fresh-' + discoveryLane));
+  }
+});
+
+test('fresh continuation uses only its selected current range and never falls back to overlapping history or audits', async () => {
+  const calls = [], provider = client(async args => {
+    calls.push(args);
+    return { tweets: [hourTweet(String(94000 + calls.length), args.cursor ? '2026-11-17T11:10:00Z' : '2026-11-17T11:50:00Z', { text: 'Entropy docs https://entropy.io/' })],
+      hasNextPage: !args.cursor, nextCursor: args.cursor ? null : 'current-evidence' };
+  });
+  let result = await advanceHourlyDiscovery(wb(data([], [])), { now: START, discoveryLane: 'evidence', client: provider });
+  const latest = result.sync.hourly.lanes.evidence.latestRange;
+  const old = frozenWindow('2026-11-10T00:00:00Z', '2026-11-17T12:30:00Z', { id: 'wide-history', discoveryLane: 'evidence', cursor: 'wide-old', query: discoveryQuery('2026-11-10T00:00:00Z', '2026-11-17T12:30:00Z', DISCOVERY_QUERY_POLICY, 'evidence') });
+  const audit = frozenWindow(latest.start, latest.endExclusive, { id: 'same-range-audit', discoveryLane: 'evidence', kind: 'audit', audit: true, cursor: 'audit-old', query: discoveryQuery(latest.start, latest.endExclusive, DISCOVERY_QUERY_POLICY, 'evidence') });
+  result.sync.hourly.pendingWindows.unshift(old, audit); result.sync.hourly.catchupRequestCount = 5;
+  result = await advanceHourlyDiscovery(result, { now: '2026-11-17T12:00:06Z', lane: 'fresh', discoveryLane: 'evidence', client: provider });
+  assert.equal(calls.length, 2); assert.equal(calls[1].cursor, 'current-evidence'); assert.equal(calls[1].query, calls[0].query);
+  assert.equal(result.sync.hourly.freshPages, 1); assert.equal(result.sync.hourly.catchupRequestCount, 5);
+  assert.equal(result.sync.hourly.lanes.evidence.latestSuccessAt, START);
+  assert.equal(result.sync.hourly.lanes.evidence.latestContinuationAt, '2026-11-17T12:00:06.000Z');
+  assert.equal(result.sync.hourly.pendingWindows.find(window => window.id === old.id).cursor, 'wide-old');
+  assert.equal(result.sync.hourly.pendingWindows.find(window => window.id === audit.id).cursor, 'audit-old');
+  result = await advanceHourlyDiscovery(result, { now: '2026-11-17T12:00:12Z', lane: 'fresh', discoveryLane: 'evidence', client: provider });
+  await advanceHourlyDiscovery(result, { now: '2026-11-17T12:00:18Z', lane: 'fresh', discoveryLane: 'context', client: provider });
+  assert.equal(calls.length, 2);
+});
+
+test('fresh first-page retry remains lane-local while other lanes succeed and keep their own hourly deadlines', async () => {
+  const calls = [], provider = client(async args => {
+    const discoveryLane = queryLane(args.query); calls.push({ ...args, discoveryLane });
+    if (calls.length === 1) throw Object.assign(new Error('SECRET'), { code: 'NETWORK_ERROR' });
+    return emptyPage();
+  });
+  let result = await advanceHourlyDiscovery(wb(data([], [])), { now: START, client: provider });
+  assert.equal(result.sync.hourly.lanes.direct.latestNextAttemptAt, LATER);
+  for (const [index, discoveryLane] of ['evidence', 'context'].entries()) result = await advanceHourlyDiscovery(result, { now: new Date(Date.parse(START) + (index + 1) * 6000).toISOString(), discoveryLane, client: provider });
+  assert.equal(calls.length, 3); assert.equal(result.sync.hourly.lanes.direct.latestError.diagnosticCode, 'NETWORK_ERROR');
+  assert.equal(result.sync.hourly.lanes.direct.latestSuccessAt, null);
+  assert.equal(result.sync.hourly.lanes.evidence.latestSuccessAt, '2026-11-17T12:00:06.000Z');
+  assert.equal(result.sync.hourly.lanes.context.latestSuccessAt, '2026-11-17T12:00:12.000Z');
+  assert.equal(result.sync.hourly.lastSuccessAt, null); assert.equal(result.sync.hourly.lastError.diagnosticCode, 'NETWORK_ERROR');
+  result = await advanceHourlyDiscovery(result, { now: '2026-11-17T12:01:00Z', lane: 'fresh', client: provider });
+  assert.equal(calls.length, 3);
+  result = await advanceHourlyDiscovery(result, { now: LATER, lane: 'fresh', client: provider });
+  assert.equal(calls.length, 4); assert.equal(calls[3].discoveryLane, 'direct'); assert.equal(calls[3].cursor, '');
+  assert.equal(result.sync.hourly.lanes.direct.latestContinuationAt, LATER); assert.equal(result.sync.hourly.lanes.direct.latestSuccessAt, null);
+  for (const discoveryLane of DISCOVERY_LANES) result = await advanceHourlyDiscovery(result, { now: '2026-11-17T12:10:00Z', discoveryLane, client: provider });
+  assert.equal(calls.length, 4);
+  for (const [index, discoveryLane] of DISCOVERY_LANES.entries()) result = await advanceHourlyDiscovery(result, { now: new Date(Date.parse('2026-11-17T13:00:00Z') + index * 6000).toISOString(), discoveryLane, client: provider });
+  assert.equal(calls.length, 7); assert.ok(calls.slice(4).every(call => call.cursor === ''));
+  assert.equal(result.sync.hourly.lastSuccessAt, '2026-11-17T13:00:00.000Z'); assert.ok(!JSON.stringify(result).includes('SECRET'));
+});
+
+test('rate-limit cooldown is shared across query lanes and all hourly actions', async () => {
+  let calls = 0; const provider = client(async () => {
+    calls++; if (calls === 1) throw Object.assign(new Error('SECRET'), { code: 'RATE_LIMITED', status: 429 });
+    return emptyPage();
+  });
+  let result = await advanceHourlyDiscovery(wb(data([], [])), { now: START, discoveryLane: 'context', client: provider });
+  assert.equal(result.sync.hourly.providerNextAttemptAt, LATER); assert.equal(result.sync.paused, false);
+  for (const lane of ['latest', 'fresh', 'catchup']) for (const discoveryLane of DISCOVERY_LANES) result = await advanceHourlyDiscovery(result, { now: '2026-11-17T12:01:00Z', lane, discoveryLane, client: provider });
+  assert.equal(calls, 1);
+  result = await advanceHourlyDiscovery(result, { now: LATER, discoveryLane: 'evidence', client: provider });
+  assert.equal(calls, 2); assert.equal(result.sync.hourly.lanes.evidence.latestSuccessAt, LATER);
+  assert.equal(result.sync.hourly.lanes.context.latestError.code, 'RATE_LIMITED'); assert.ok(!JSON.stringify(result).includes('SECRET'));
+});
+
+test('fresh cursor recovery keeps split windows inside their lane and current range ahead of old work', async () => {
+  let calls = 0; const provider = client(async args => {
+    calls++;
+    if (calls === 1) return { tweets: [hourTweet('95000', undefined, { text: 'Entropy HIP-3 perpetual markets' })], hasNextPage: true, nextCursor: 'context-tail' };
+    if (calls < 4) throw Object.assign(new Error('SECRET'), { code: 'REQUEST_TIMEOUT' });
+    assert.equal(queryLane(args.query), 'context'); assert.equal(args.cursor, '');
+    return emptyPage();
+  });
+  let result = await advanceHourlyDiscovery(wb(data([], [])), { now: START, discoveryLane: 'context', client: provider });
+  const latest = structuredClone(result.sync.hourly.lanes.context.latestRange);
+  result.sync.hourly.pendingWindows.unshift(frozenWindow('2026-11-10T00:00:00Z', '2026-11-11T00:00:00Z', { id: 'history', discoveryLane: 'context', cursor: 'history-only' }));
+  for (let attempt = 0; attempt < 2; attempt++) result = await advanceHourlyDiscovery(result, { now: result.sync.hourly.lanes.context.latestNextAttemptAt, lane: 'fresh', discoveryLane: 'context', client: provider });
+  assert.equal(calls, 3); assert.equal(result.sync.hourly.splitWindows, 1);
+  result = await advanceHourlyDiscovery(result, { now: result.sync.hourly.lanes.context.latestNextAttemptAt, lane: 'fresh', discoveryLane: 'context', client: provider });
+  assert.equal(calls, 4); assert.equal(result.sync.hourly.pendingWindows.find(window => window.id === 'history').cursor, 'history-only');
+  const recovered = result.sync.hourly.lanes.context.latestContinuationWindow;
+  assert.ok(Date.parse(recovered.start) >= Date.parse(latest.start)); assert.ok(Date.parse(recovered.endExclusive) <= Date.parse(latest.endExclusive));
+  assert.equal(result.sync.hourly.catchupRequestCount, 0); assert.ok(!JSON.stringify(result).includes('SECRET'));
+});
+
+test('v3 unrequested broad first page is due independently of the legacy direct deadline', async () => {
+  const start = '2026-11-17T10:55:00.000Z', latestRange = { start, endExclusive: START };
+  const window = frozenWindow(start, START, { discoveryLane: 'context', kind: 'latest', query: discoveryQuery(start, START, DISCOVERY_QUERY_POLICY, 'context') });
+  const before = wb(data([], []), { hourly: hourlyState({ nextRunAt: '2026-11-17T13:00:00Z', pendingWindows: [window], lanes: { context: { latestPlannedThrough: START, latestRange, lastSuccessAt: '2026-11-17T11:59:00Z' } } }) });
+  let calls = 0;
+  const result = await advanceHourlyDiscovery(before, { now: START, discoveryLane: 'context', client: client(async args => { calls++; assert.equal(args.cursor, ''); assert.equal(queryLane(args.query), 'context'); return emptyPage(); }) });
+  assert.equal(calls, 1); assert.equal(result.sync.hourly.lanes.context.latestSuccessAt, START);
+  assert.equal(result.sync.hourly.lastSuccessAt, null); assert.equal(result.sync.nextRunAt, '2026-11-17T13:00:00Z');
+});
+
+test('paused and zero-budget v3 checkpoints retain flat direct success and due timestamps before migration', async () => {
+  for (const options of [{ sync: { paused: true } }, { sync: {}, maxRequests: 0 }]) {
+    const before = wb(data([], []), { ...options.sync, hourly: hourlyState({ lanes: { direct: { completedRanges: [] }, evidence: {}, context: {} },
+      lastSuccessAt: START, nextRunAt: '2026-11-17T13:00:00Z', latestWindow: { status: 'complete' } }) });
+    const result = await advanceHourlyDiscovery(before, { now: LATER, maxRequests: options.maxRequests ?? 1, client: client(async () => { throw new Error('Must not request.'); }) });
+    assert.equal(result.sync.hourly.lastSuccessAt, START); assert.equal(result.sync.hourly.nextRunAt, '2026-11-17T13:00:00Z');
+    assert.deepEqual(result.sync.hourly.latestWindow, { status: 'complete' });
+  }
+});
+
+test('a v3 provider rate-limit deadline cannot be bypassed by a newly enabled broad lane', async () => {
+  let calls = 0;
+  const before = wb(data([], []), { hourly: hourlyState({ nextAttemptAt: LATER, nextRunAt: '2026-11-17T13:00:00Z', lastError: { code: 'RATE_LIMITED', at: START } }) });
+  const result = await advanceHourlyDiscovery(before, { now: '2026-11-17T12:01:00Z', discoveryLane: 'context', client: client(async () => { calls++; return emptyPage(); }) });
+  assert.equal(calls, 0); assert.equal(result.sync.hourly.providerNextAttemptAt, LATER);
+  assert.equal(result.sync.hourly.lanes.context.latestAttemptAt, null);
+});
+
+test('next-hour fresh pagination recovers from a prior range failure while retaining the failed old cursor', async () => {
+  const calls = [], provider = client(async args => {
+    calls.push(args);
+    if (calls.length === 2) throw Object.assign(new Error('SECRET'), { status: 503 });
+    const old = calls.length === 1;
+    return { tweets: [hourTweet(String(96000 + calls.length), old ? '2026-11-17T11:50:00Z' : args.cursor ? '2026-11-17T12:10:00Z' : '2026-11-17T12:50:00Z', { text: 'Entropy HIP-3 perpetual markets' })],
+      hasNextPage: !args.cursor, nextCursor: args.cursor ? null : old ? 'failed-old-tail' : 'new-hour-tail' };
+  });
+  let result = await advanceHourlyDiscovery(wb(data([], [])), { now: START, discoveryLane: 'context', client: provider });
+  result = await advanceHourlyDiscovery(result, { now: '2026-11-17T12:00:06Z', lane: 'fresh', discoveryLane: 'context', client: provider });
+  assert.equal(result.sync.hourly.lanes.context.latestContinuationError.httpStatus, 503);
+  assert.equal(result.sync.hourly.lanes.context.latestContinuationWindow.status, 'error');
+  result = await advanceHourlyDiscovery(result, { now: '2026-11-17T13:00:00Z', discoveryLane: 'context', client: provider });
+  assert.equal(result.sync.hourly.lanes.context.latestContinuationError, null);
+  assert.equal(result.sync.hourly.lanes.context.latestContinuationWindow, null);
+  assert.ok(result.sync.hourly.pendingWindows.some(window => window.cursor === 'failed-old-tail'));
+  result = await advanceHourlyDiscovery(result, { now: '2026-11-17T13:00:06Z', lane: 'fresh', discoveryLane: 'context', client: provider });
+  assert.equal(calls.length, 4); assert.equal(calls[3].cursor, 'new-hour-tail'); assert.equal(result.sync.hourly.lanes.context.latestContinuationWindow.status, 'complete');
+  assert.equal(result.sync.hourly.lanes.context.latestContinuationAt, '2026-11-17T13:00:06.000Z');
+  assert.ok(result.sync.hourly.pendingWindows.some(window => window.cursor === 'failed-old-tail')); assert.ok(!JSON.stringify(result).includes('SECRET'));
 });

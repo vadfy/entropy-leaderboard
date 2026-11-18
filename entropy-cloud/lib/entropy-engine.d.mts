@@ -16,6 +16,6 @@ export const seed: DataObject;
 export function createClient(options: { apiKey: string; fetchImpl?: typeof fetch; timeoutMs?: number }): SourceClient;
 export function mergeDataset(previous: DataObject, incoming: DataObject): DataObject;
 export function advanceSync(workbench: SourceState, options: StepOptions): Promise<SourceState>;
-export function advanceHourlyDiscovery(workbench: SourceState, options: StepOptions & { lane?: 'latest' | 'catchup' }): Promise<SourceState>;
+export function advanceHourlyDiscovery(workbench: SourceState, options: StepOptions & { lane?: 'latest' | 'fresh' | 'catchup'; discoveryLane?: 'direct' | 'evidence' | 'context' }): Promise<SourceState>;
 export function beginBackfill(workbench: SourceState, options: { start: string; endExclusive: string; requestLimit?: number; method?: 'search' | 'mentions' | 'id-search'; now?: Clock }): SourceState;
 export function advanceBackfill(workbench: SourceState, options: { client: SourceClient; now?: Clock }): Promise<SourceState>;

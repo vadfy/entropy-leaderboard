@@ -1,5 +1,5 @@
 export const UPSTREAM_URL = 'https://entropyio-leaderboard.vadfy.chatgpt.site/api/leaderboard';
-const ETAG = /^"entropy-(?:empty|[0-9]+)"$/;
+const ETAG = /^(?:W\/)?"entropy-(?:empty|[0-9]+)"$/;
 const SECURITY_HEADERS = {
   'x-content-type-options': 'nosniff',
   'referrer-policy': 'no-referrer',
@@ -17,6 +17,7 @@ function cachePolicy(value) {
   return value && value.length <= 512 && /^[\x20-\x7e]+$/.test(value) ? value : 'no-store';
 }
 function validETag(value) { return typeof value === 'string' && value.length <= 128 && ETAG.test(value) ? value : null; }
+function revisionTag(value) { return value?.replace(/^W\//, ''); }
 
 /** A fixed public read, with no environment credentials or caller-selected target. */
 export function createLeaderboardProxy({ fetchImpl = globalThis.fetch, timeoutMs = 10000,
@@ -54,7 +55,10 @@ export function createLeaderboardProxy({ fetchImpl = globalThis.fetch, timeoutMs
     const validator = validETag(request.headers.get('if-none-match'));
     try {
       const headers = { Accept: 'application/json' };
-      if (validator) headers['If-None-Match'] = validator;
+      // The Sites edge may weaken the origin's tag during compression. GET
+      // If-None-Match uses weak comparison; send the origin's canonical tag so
+      // its exact comparison also recognizes the same snapshot revision.
+      if (validator) headers['If-None-Match'] = revisionTag(validator);
       upstream = await fetchImpl(UPSTREAM_URL, {
         method: 'GET', headers, credentials: 'omit', cache: 'no-store',
         redirect: 'manual', signal: abort.signal,
@@ -67,7 +71,7 @@ export function createLeaderboardProxy({ fetchImpl = globalThis.fetch, timeoutMs
       const headersOut = new Headers({ ...SECURITY_HEADERS,
         'cache-control': cachePolicy(upstream.headers.get('cache-control')) });
       if (etag) headersOut.set('etag', etag);
-      if (upstream.status === 304 && validator && etag === validator) {
+      if (upstream.status === 304 && validator && etag && revisionTag(etag) === revisionTag(validator)) {
         finished = true;
         cleanup();
         return new Response(null, { status: 304, headers: headersOut });

@@ -117,6 +117,49 @@ test('documented product context remains usable when the author also discusses s
   assert.ok(result.signals.includes('science_context'));
   assert.deepEqual(validatedRelevance(result), result);
 });
+test('RomanChainOps security-article regression cannot borrow distant trading and Hyperliquid context', () => {
+  // Public post 2123037219807982064 uses entropy for signing randomness, not
+  // the project. Keep the diagnostic phrase, with paraphrased article context.
+  const source = tweet('A Lighter perpetual trading incident involved a reused ECDSA nonce. Funds later reached Hyperliquid.\n\n'
+    + 'The investigation describes order signatures, market making and a security council. '.repeat(16)
+    + '\n\nNever rely on custom PRNGs or arbitrary entropy in signing SDKs.');
+  const result = classifyTweet(source);
+  assert.equal(result.status, 'review');
+  assert.deepEqual(result.reasonCodes, ['AMBIGUOUS_ENTROPY']);
+  assert.ok(result.signals.includes('science_context'));
+  assert.ok(result.signals.includes('hyperliquid_context'));
+  assert.ok(!result.signals.includes('product_context'));
+  assert.deepEqual(validatedRelevance(result), result);
+});
+test('a long security article can independently establish real untagged Entropy product context', () => {
+  const source = tweet('Never rely on custom PRNGs or arbitrary entropy in signing SDKs.\n\n'
+    + 'This security analysis also reviews operational safeguards and key management. '.repeat(16)
+    + '\n\nEntropy builds pre-IPO perpetual markets on Hyperliquid. This is a separate product discussion.');
+  const result = classifyTweet(source);
+  assert.equal(result.status, 'accepted');
+  assert.deepEqual(result.reasonCodes, ['PROJECT_CONTEXT']);
+  assert.ok(result.signals.includes('science_context'));
+  assert.ok(result.signals.includes('product_context'));
+  assert.deepEqual(validatedRelevance(result), result);
+});
+test('technical entropy sources cannot become a project just because the article discusses a trading venue', () => {
+  for (const phrase of ['Weak entropy for nonces compromises ECDSA signatures.',
+    'Entropy sources provide random bits for cryptographic signing.',
+    'Cryptographic entropy protects signing keys.']) {
+    const result = classifyTweet(tweet('Hyperliquid perpetual markets appear in the incident report.\n\n'
+      + 'The report discusses an unrelated platform and its operational security. '.repeat(12) + phrase));
+    assert.notEqual(result.status, 'accepted', phrase);
+    assert.deepEqual(validatedRelevance(result), result);
+  }
+});
+test('technical entropy discussion never overrides direct mentions or official target evidence', () => {
+  const body = 'An article about arbitrary entropy in signing SDKs also discusses Hyperliquid trading.';
+  for (const source of [tweet(body + ' @entropyIO'), tweet(body, {
+    entities: { urls: [link('https://docs.entropy.io/about-entropy/readme')] },
+  }), tweet(body, { quoted_tweet: { id: '123', author: { userName: 'entropyIO' } } })]) {
+    assert.equal(classifyTweet(source).status, 'accepted');
+  }
+});
 test('scientific metaphors mixed with generic trading or creator context stay reviewable', () => {
   for (const value of ['Entropy trading makes the randomness of markets easier to navigate.',
     'Entropy creators bring order to randomness in our community.', 'Shannon entropy helps this crypto discussion.']) {

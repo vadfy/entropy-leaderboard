@@ -367,15 +367,25 @@ test('private service status and disabled ticks whitelist summary without auto e
   }
   assert.equal(control().daily_attempts, 0);
 });
-test('private service writer accepts absent or same origin, performs one due tick and preserves next due time', async () => {
+async function withCycleClock(action) {
+  const originalClock = Date.now, originalTimeout = globalThis.setTimeout;
+  let now = Date.now() + 1000;
+  Date.now = () => now;
+  globalThis.setTimeout = (callback, delay, ...args) => { now += Number(delay) || 0; queueMicrotask(() => callback(...args)); return { unref() {} }; };
+  try { return await action({ now: () => now, advance: milliseconds => { now += milliseconds; } }); }
+  finally { Date.now = originalClock; globalThis.setTimeout = originalTimeout; }
+}
+test('private service writer accepts absent or same origin, checks every due lane and preserves next due time', async () => withCycleClock(async () => {
   fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
   let calls = 0; globalThis.fetch = async () => { calls++; return emptyProvider(); };
   const first = await internal.POST(internalRequest()); assert.equal(first.status, 200);
-  const payload = await first.json(); assert.equal(calls, 1); assert.equal(payload.sync.attemptBudget.count, 1); assert.ok(payload.sync.lastSuccessAt);
+  const payload = await first.json(); assert.equal(calls, 3); assert.equal(payload.sync.attemptBudget.count, 3); assert.ok(payload.sync.lastSuccessAt);
+  assert.equal(payload.sync.hourly.cycle.source, 'service'); assert.equal(payload.sync.hourly.cycle.status, 'complete');
+  assert.equal(payload.sync.collectionHealth.allLanesCurrent, true);
   const again = await internal.POST(internalRequest('{}', { origin: 'https://entropy.example' })); assert.equal(again.status, 200);
-  const unchanged = await again.json(); assert.equal(calls, 1); assert.equal(unchanged.revision, payload.revision);
-  assert.equal(unchanged.sync.nextRunAt, payload.sync.nextRunAt); assert.equal(control().daily_attempts, 1);
-});
+  const unchanged = await again.json(); assert.equal(calls, 3); assert.equal(unchanged.revision, payload.revision);
+  assert.equal(unchanged.sync.nextRunAt, payload.sync.nextRunAt); assert.equal(control().daily_attempts, 3);
+}));
 test('private service writer reports redacted server errors and does not resume paused collection', async () => {
   fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
   globalThis.fetch = async () => ({ ok: false, status: 402 });
@@ -514,7 +524,7 @@ test('historical daily cap and stopped jobs never access the provider; only an e
   try {
     fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
     const range = historicalRange(base, 1); value = await store.startBackfill(range); now += 6000;
-    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=264').run(new Date(now).toISOString().slice(0, 10));
+    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=216').run(new Date(now).toISOString().slice(0, 10));
     await assert.rejects(store.runBackfill(), error => error.code === 'FRESH_DISCOVERY_RESERVE');
     sqlite.prepare('UPDATE entropy_control SET daily_attempts=0').run();
     let calls = 0; globalThis.fetch = async () => { calls++; return emptySearchPage(); };
@@ -532,15 +542,15 @@ test('historical collection stops at the fresh-discovery reserve, including a ra
     fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
     await store.startBackfill(historicalRange(now)); now += 6000;
     const today = new Date(now).toISOString().slice(0, 10);
-    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=263').run(today);
+    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=215').run(today);
     let calls = 0; globalThis.fetch = async () => { calls++; return emptySearchPage(); };
-    value = await store.runBackfill(); assert.equal(calls, 1); assert.equal(control().daily_attempts, 264);
+    value = await store.runBackfill(); assert.equal(calls, 1); assert.equal(control().daily_attempts, 216);
     now += 6000;
     await assert.rejects(store.runBackfill(), error => error.code === 'FRESH_DISCOVERY_RESERVE');
-    assert.equal(calls, 1); assert.equal(control().daily_attempts, 264);
-    await store.runSync(undefined, true); assert.equal(calls, 2); assert.equal(control().daily_attempts, 265);
+    assert.equal(calls, 1); assert.equal(control().daily_attempts, 216);
+    await store.runSync(undefined, true); assert.equal(calls, 2); assert.equal(control().daily_attempts, 217);
     now += 6000;
-    sqlite.prepare('UPDATE entropy_control SET daily_attempts=263').run();
+    sqlite.prepare('UPDATE entropy_control SET daily_attempts=215').run();
     let raced = false;
     scope.DB = { ...database, prepare(sql) {
       const statement = database.prepare(sql);
@@ -549,7 +559,7 @@ test('historical collection stops at the fresh-discovery reserve, including a ra
         statement.bind = (...args) => {
           const bound = bind(...args), run = bound.run.bind(bound);
           bound.run = async () => {
-            raced = true; sqlite.prepare('UPDATE entropy_control SET daily_attempts=264').run();
+            raced = true; sqlite.prepare('UPDATE entropy_control SET daily_attempts=216').run();
             return run();
           };
           return bound;
@@ -558,7 +568,7 @@ test('historical collection stops at the fresh-discovery reserve, including a ra
       return statement;
     } };
     await assert.rejects(store.runBackfill(), error => error.code === 'FRESH_DISCOVERY_RESERVE');
-    assert.equal(raced, true); assert.equal(calls, 2); assert.equal(control().daily_attempts, 264);
+    assert.equal(raced, true); assert.equal(calls, 2); assert.equal(control().daily_attempts, 216);
     assert.equal(control().lease_token, null);
   } finally { scope.DB = database; Date.now = clock; }
 });
@@ -774,7 +784,7 @@ test('exact-ID recovery respects disabled collection, fresh reserve, and redacts
     let value = await store.getWorkbench(); fakeKey();
     await assert.rejects(store.runPostRepair(ids), error => error.code === 'COLLECTOR_DISABLED');
     value = await store.setCollector(true, value.revision); now += 6000;
-    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=264').run(new Date(now).toISOString().slice(0, 10));
+    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=216').run(new Date(now).toISOString().slice(0, 10));
     await assert.rejects(store.runPostRepair(ids), error => error.code === 'FRESH_DISCOVERY_RESERVE');
     sqlite.prepare('UPDATE entropy_control SET daily_attempts=0').run();
     let calls = 0; globalThis.fetch = async () => { calls++; return { ok: false, status: 402, json: async () => ({ secret: scope.TWITTERAPI_IO_KEY }) }; };
@@ -834,7 +844,7 @@ test('hourly discovery checks new mentions even with a metrics backlog and prese
     assert.equal(calls, 1); assert.equal(result.dataset.posts.length, 25); assert.deepEqual(result.sync.refresh.pendingIds, pendingIds);
     assert.equal(result.state.bans[authorId].reason, 'Existing public reason');
     assert.equal(result.state.bans[authorId].internalNote, 'PRIVATE_STAYS_PRIVATE');
-    assert.equal(result.sync.collectionHealth.policy, 'new-mentions-first'); assert.equal(result.sync.collectionHealth.freshness, 'current');
+    assert.equal(result.sync.collectionHealth.policy, 'new-mentions-first'); assert.equal(result.sync.collectionHealth.freshness, 'partial');
     assert.equal(result.sync.hourly.lastSuccessAt, new Date(now).toISOString());
     now += 2 * 3600000; assert.equal((await store.getStatus()).sync.collectionHealth.freshness, 'stale');
   } finally { Date.now = clock; }
@@ -884,12 +894,12 @@ test('maintenance preserves a daily allowance for fresh discovery and cannot tak
     fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
     globalThis.fetch = async () => discoveryResponse([discoveryTweet(now)], true, 'next-A');
     value = await store.runSync(undefined, true); now += 6000;
-    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=264').run(new Date(now).toISOString().slice(0, 10));
+    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=216').run(new Date(now).toISOString().slice(0, 10));
     let calls = 0; globalThis.fetch = async () => { calls++; return discoveryResponse([]); };
     await assert.rejects(store.runHourlyCatchup(), error => error.code === 'FRESH_DISCOVERY_RESERVE');
     await assert.rejects(store.runMetricsRefresh(), error => error.code === 'FRESH_DISCOVERY_RESERVE');
-    assert.equal(calls, 0); assert.equal(control().daily_attempts, 264);
-    const fresh = await store.runSync(undefined, true); assert.equal(calls, 1); assert.equal(control().daily_attempts, 265);
+    assert.equal(calls, 0); assert.equal(control().daily_attempts, 216);
+    const fresh = await store.runSync(undefined, true); assert.equal(calls, 1); assert.equal(control().daily_attempts, 217);
     now = Date.parse(fresh.sync.hourly.nextRunAt) + 1000;
     const before = control().daily_attempts; await store.runHourlyCatchup(); await store.runMetricsRefresh();
     assert.equal(calls, 1); assert.equal(control().daily_attempts, before);
@@ -916,7 +926,9 @@ test('metrics maintenance adapts failed batches and keeps every queued ID withou
       assert.deepEqual(new Set(value.sync.refresh.pendingIds), ids); assertDiscoveryUnchanged(value.sync.hourly, latest);
       assert.equal(value.sync.nextRunAt, nextRun); assert.equal(value.dataset.posts.length, ids.size);
       assert.equal(value.sync.paused, false); assert.ok(!JSON.stringify(value).includes(scope.TWITTERAPI_IO_KEY));
-      now = Date.parse(value.sync.hourly.nextRunAt) + 1000;
+      // Fresh collection is aligned to :35; metrics retain their separate retry
+      // deadline, so the second batch must wait for both to become eligible.
+      now = Math.max(Date.parse(value.sync.hourly.nextRunAt), Date.parse(value.sync.metricsRefresh.nextRunAt) || 0) + 1000;
     }
     assert.deepEqual(requestedSizes, [20, 10]);
   } finally { Date.now = clock; }
@@ -982,3 +994,223 @@ test('successful metrics maintenance advances only its selected IDs and preserve
     const attempts = control().daily_attempts; now += 6000; await store.runMetricsRefresh(); assert.equal(control().daily_attempts, attempts);
   } finally { Date.now = clock; }
 });
+
+const queryLane = query => query.startsWith('@entropyIO ') ? 'direct' : query.startsWith('(url:entropy.io ') ? 'evidence' : 'context';
+function cycleTweet(now, lane, index = 0) {
+  const id = String(1900000000000010000n + BigInt((lane === 'direct' ? 0 : lane === 'evidence' ? 100 : 200) + index));
+  return { ...discoveryTweet(now, id, (index + 1) * 60000),
+    text: lane === 'direct' ? 'Useful @entropyIO research.' : lane === 'evidence' ? 'Useful product research https://t.co/product' : 'Entropy HIP-3 perpetual markets built on Hyperliquid.',
+    ...(lane === 'evidence' ? { entities: { urls: [{ expanded_url: 'https://entropy.io/' }] } } : {}) };
+}
+test('unattended MCP cycle checks all fresh lanes before pagination despite old contextual history', async () => withCycleClock(async ({ now }) => {
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  const oldStart = new Date(now() - 86400000).toISOString(), oldEnd = new Date(now() - 80000000).toISOString();
+  patchSyncFixture({ hourly: { queryPolicy: 'entropy-context-v1', lanes: {}, pendingWindows: [
+    { id: 'old-context-history', discoveryLane: 'context', queryPolicy: 'entropy-context-v1', method: 'search', kind: 'audit', audit: true,
+      query: 'Entropy -filter:replies -filter:nativeretweets since_time:1 until_time:2', start: oldStart, endExclusive: oldEnd, cursor: 'OLD-HISTORY-CURSOR', seenCursors: [] },
+  ] } });
+  const requests = [];
+  globalThis.fetch = async url => {
+    const target = new URL(url), query = target.searchParams.get('query'), lane = queryLane(query), cursor = target.searchParams.get('cursor');
+    requests.push({ lane, cursor }); assert.notEqual(cursor, 'OLD-HISTORY-CURSOR');
+    assert.ok(query.includes('-filter:replies')); assert.ok(query.includes('-filter:nativeretweets'));
+    return discoveryResponse([cycleTweet(now(), lane, cursor ? 2 : 0)], !cursor, cursor ? '' : 'fresh-' + lane);
+  };
+  const response = await mcp.POST(new Request('https://entropy.example/mcp', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'entropy_sync', arguments: {} } }) }));
+  const result = (await response.json()).result.structuredContent;
+  assert.deepEqual(requests.map(value => value.lane), ['direct', 'evidence', 'context', 'direct', 'evidence', 'context']);
+  assert.equal(result.sync.hourly.cycle.requestCount, 6); assert.equal(result.sync.hourly.cycle.source, 'mcp');
+  assert.equal(result.sync.hourly.cycle.status, 'complete'); assert.ok(result.sync.hourly.cycle.finishedAt);
+  assert.equal(result.sync.collectionHealth.allLanesCurrent, true); assert.equal(result.sync.collectionHealth.freshness, 'current');
+  assert.ok(result.sync.hourly.pendingWindows.some(window => window.id === 'old-context-history'));
+  const publicSnapshot = await store.getCommunityPreview();
+  for (const lane of ['direct', 'evidence', 'context']) assert.ok(publicSnapshot.public.posts.some(post => post.id === cycleTweet(now(), lane).id));
+  assert.equal(control().daily_attempts, 6); assert.equal(control().lease_token, null);
+}));
+test('busy fresh pagination is fair and bounded while every primary lane gets a slot', async () => withCycleClock(async ({ now }) => {
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  const requests = [], pages = { direct: 0, evidence: 0, context: 0 };
+  globalThis.fetch = async url => {
+    const target = new URL(url), lane = queryLane(target.searchParams.get('query'));
+    requests.push(lane); const page = pages[lane]++;
+    return discoveryResponse([cycleTweet(now(), lane, page)], true, lane + '-page-' + page);
+  };
+  value = await store.runHourlyCycle('service');
+  assert.equal(requests.length, 9); assert.deepEqual(requests.slice(0, 3), ['direct', 'evidence', 'context']);
+  assert.deepEqual(pages, { direct: 3, evidence: 3, context: 3 });
+  assert.equal(value.sync.hourly.cycle.status, 'partial'); assert.equal(value.sync.hourly.cycle.stopCode, 'REQUEST_LIMIT');
+  assert.equal(control().daily_attempts, 9); assert.equal(value.sync.collectionHealth.allLanesCurrent, true);
+  assert.ok(['direct', 'evidence', 'context'].every(lane => value.sync.hourly.cycle.lanes[lane].pendingFreshWindows > 0));
+}));
+test('fresh pagination cannot consume the reserved first-page allowance for later hourly lanes', async () => withCycleClock(async ({ now, advance }) => {
+  const day = Math.floor(now() / 86400000) * 86400000;
+  advance(day + 13 * 3600000 + 5 * 60000 - now());
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  patchSyncFixture({ nextRunAt: new Date(now()).toISOString() });
+  const limit = value.sync.collectionHealth.freshPaginationDailyLimit;
+  sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=?').run(new Date(now()).toISOString().slice(0, 10), limit);
+  const requests = [];
+  globalThis.fetch = async url => { const lane = queryLane(new URL(url).searchParams.get('query')); requests.push(lane); return discoveryResponse([cycleTweet(now(), lane)], true, 'fresh-' + lane); };
+  value = await store.runHourlyCycle('service');
+  assert.deepEqual(requests, ['direct', 'evidence', 'context']); assert.equal(control().daily_attempts, limit + 3);
+  assert.equal(value.sync.hourly.cycle.status, 'partial'); assert.equal(value.sync.hourly.cycle.stopCode, 'FRESH_DISCOVERY_RESERVE');
+  assert.equal(value.sync.collectionHealth.freshDiscoveryReserve, 72); assert.equal(value.sync.collectionHealth.catchupDailyLimit, 216);
+  assert.equal(value.sync.collectionHealth.freshPaginationReserve, 33); assert.equal(value.sync.collectionHealth.freshPaginationDailyLimit, 255);
+}));
+test('fresh pagination reserve follows the remaining :35 slots and resets at UTC midnight', async () => withCycleClock(async ({ now, advance }) => {
+  const day = Math.floor(now() / 86400000) * 86400000;
+  const cases = [
+    [5 * 60000, 72, 216],
+    [13 * 3600000 + 5 * 60000, 33, 255],
+    [13 * 3600000 + 36 * 60000, 30, 258],
+    [23 * 3600000 + 34 * 60000, 3, 285],
+    [23 * 3600000 + 36 * 60000, 0, 288],
+    [86400000 + 5 * 60000, 72, 216],
+  ];
+  for (const [offset, reserve, limit] of cases) {
+    advance(day + offset - now());
+    const status = await store.getStatus();
+    assert.equal(status.sync.collectionHealth.freshPaginationReserve, reserve);
+    assert.equal(status.sync.collectionHealth.freshPaginationDailyLimit, limit);
+    assert.equal(reserve + limit, 288); assert.equal(status.sync.collectionHealth.catchupDailyLimit, 216);
+  }
+  assert.equal(control().daily_attempts, 0);
+}));
+test('221 spent requests still allow afternoon fresh pages without reopening historical maintenance', async () => withCycleClock(async ({ now, advance }) => {
+  const day = Math.floor(now() / 86400000) * 86400000;
+  advance(day + 13 * 3600000 + 5 * 60000 - now());
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  patchSyncFixture({ nextRunAt: new Date(now()).toISOString() });
+  sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=221').run(new Date(now()).toISOString().slice(0, 10));
+  const requests = [];
+  globalThis.fetch = async url => {
+    const target = new URL(url), lane = queryLane(target.searchParams.get('query')), cursor = target.searchParams.get('cursor');
+    requests.push(lane); return discoveryResponse([cycleTweet(now(), lane, cursor ? 2 : 0)], !cursor, cursor ? '' : 'fresh-' + lane);
+  };
+  value = await store.runHourlyCycle('service');
+  assert.deepEqual(requests, ['direct', 'evidence', 'context', 'direct', 'evidence', 'context']);
+  assert.equal(control().daily_attempts, 227); assert.equal(value.sync.hourly.cycle.status, 'complete');
+  assert.equal(value.sync.collectionHealth.freshPaginationDailyLimit, 255);
+  assert.equal(value.sync.collectionHealth.freshPaginationReserve, 33);
+  advance(6000);
+  await assert.rejects(store.runHourlyCatchup(), error => error.code === 'FRESH_DISCOVERY_RESERVE');
+  await assert.rejects(store.runMetricsRefresh(), error => error.code === 'FRESH_DISCOVERY_RESERVE');
+  await assert.rejects(store.runPostRepair([value.dataset.posts[0].id]), error => error.code === 'FRESH_DISCOVERY_RESERVE');
+  assert.equal(requests.length, 6); assert.equal(control().daily_attempts, 227);
+}));
+test('zero late-night reserve never raises the 288 hard cap and the next UTC day gets its own allowance', async () => withCycleClock(async ({ now, advance }) => {
+  const day = Math.floor(now() / 86400000) * 86400000;
+  advance(day + 23 * 3600000 + 36 * 60000 - now());
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=288').run(new Date(now()).toISOString().slice(0, 10));
+  let requests = 0; globalThis.fetch = async () => { requests++; return emptyProvider(); };
+  await assert.rejects(store.runHourlyCycle('service'), error => error.code === 'DAILY_LIMIT');
+  let status = await store.getStatus();
+  assert.equal(status.sync.collectionHealth.freshPaginationReserve, 0); assert.equal(status.sync.collectionHealth.freshPaginationDailyLimit, 288);
+  assert.equal(status.sync.attemptBudget.count, 288); assert.equal(requests, 0);
+  advance(day + 86400000 + 5 * 60000 - now());
+  status = await store.getStatus();
+  assert.equal(status.sync.attemptBudget.count, 0); assert.equal(status.sync.collectionHealth.freshPaginationReserve, 72);
+  value = await store.runHourlyCycle('mcp');
+  assert.equal(requests, 3); assert.equal(control().daily_attempts, 3); assert.equal(value.sync.attemptBudget.count, 3);
+  assert.equal(control().daily_date, new Date(now()).toISOString().slice(0, 10));
+  assert.equal(value.sync.collectionHealth.freshPaginationDailyLimit, 216); assert.equal(value.sync.hourly.cycle.status, 'complete');
+}));
+test('one transient lane failure remains visible while other fresh lanes are checked', async () => withCycleClock(async ({ now }) => {
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  const requests = [];
+  globalThis.fetch = async url => {
+    const lane = queryLane(new URL(url).searchParams.get('query')); requests.push(lane);
+    return lane === 'direct' ? { ok: false, status: 500 } : discoveryResponse([cycleTweet(now(), lane)]);
+  };
+  value = await store.runHourlyCycle('service');
+  assert.deepEqual(requests, ['direct', 'evidence', 'context']); assert.equal(control().daily_attempts, 3);
+  assert.equal(value.sync.hourly.cycle.status, 'partial'); assert.ok(value.sync.hourly.cycle.lanes.direct.primaryError);
+  assert.equal(value.sync.collectionHealth.lanes.direct.freshness, 'error');
+  assert.equal(value.sync.collectionHealth.lanes.context.freshness, 'current');
+  assert.equal(value.sync.collectionHealth.freshness, 'error'); assert.equal(value.sync.collectionHealth.allLanesCurrent, false);
+}));
+test('failed contextual first page cannot stall healthy fresh continuations behind its retry deadline', async () => withCycleClock(async ({ now }) => {
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  const requests = [];
+  globalThis.fetch = async url => {
+    const target = new URL(url), lane = queryLane(target.searchParams.get('query')), cursor = target.searchParams.get('cursor');
+    requests.push(lane);
+    if (lane === 'context') return { ok: false, status: 503 };
+    return discoveryResponse([cycleTweet(now(), lane, cursor ? 2 : 0)], !cursor, cursor ? '' : 'fresh-' + lane);
+  };
+  const started = now(); value = await store.runHourlyCycle('service');
+  assert.deepEqual(requests, ['direct', 'evidence', 'context', 'direct', 'evidence']);
+  assert.equal(control().daily_attempts, 5); assert.equal(value.sync.hourly.cycle.requestCount, 5);
+  assert.equal(value.sync.hourly.cycle.status, 'partial'); assert.ok(value.sync.hourly.cycle.lanes.context.primaryError);
+  assert.equal(value.sync.hourly.cycle.lanes.direct.pendingFreshWindows, 0);
+  assert.equal(value.sync.hourly.cycle.lanes.evidence.pendingFreshWindows, 0);
+  assert.ok(now() - started < 40000, 'a lane retry must not turn into a no-op spin');
+}));
+test('a new cycle first page honors durable spacing after the previous data commit', async () => withCycleClock(async ({ now }) => {
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  const committedAt = Date.parse(value.updatedAt), attempts = [];
+  globalThis.fetch = async () => { attempts.push(now()); return emptyProvider(); };
+  value = await store.runHourlyCycle('service');
+  assert.equal(attempts.length, 3); assert.ok(attempts[0] - committedAt >= 5100);
+  assert.ok(attempts[1] - attempts[0] >= 5100); assert.ok(attempts[2] - attempts[1] >= 5100);
+  assert.equal(value.sync.hourly.cycle.status, 'complete');
+}));
+test('a manual early-hour cycle preserves the upcoming :35 automatic slot for every lane', async () => withCycleClock(async ({ now, advance }) => {
+  const hour = Math.floor(now() / 3600000) * 3600000 + 3600000;
+  advance(hour + 5 * 60000 - now());
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  const requests = [];
+  globalThis.fetch = async url => { requests.push({ lane: queryLane(new URL(url).searchParams.get('query')), at: now() }); return emptyProvider(); };
+  value = await store.runHourlyCycle('service');
+  const upcoming = new Date(hour + 35 * 60000).toISOString();
+  assert.equal(requests.length, 3);
+  for (const lane of ['direct', 'evidence', 'context']) assert.equal(value.sync.hourly.lanes[lane].latestNextRunAt, upcoming);
+  assert.equal(value.sync.hourly.nextRunAt, upcoming); assert.equal(value.sync.nextRunAt, upcoming);
+  const manualRevision = value.revision;
+  value = await store.runHourlyCycle('mcp');
+  assert.equal(requests.length, 3); assert.equal(value.revision, manualRevision);
+  advance(hour + 35 * 60000 + 1000 - now());
+  value = await store.runHourlyCycle('mcp');
+  assert.deepEqual(requests.map(request => request.lane), ['direct', 'evidence', 'context', 'direct', 'evidence', 'context']);
+  assert.ok(requests.slice(3).every(request => request.at >= hour + 35 * 60000));
+  const nextHour = new Date(hour + 3600000 + 35 * 60000).toISOString();
+  for (const lane of ['direct', 'evidence', 'context']) assert.equal(value.sync.hourly.lanes[lane].latestNextRunAt, nextHour);
+  assert.equal(value.sync.hourly.nextRunAt, nextHour); assert.equal(value.sync.nextRunAt, nextHour);
+  const automaticRevision = value.revision;
+  value = await store.runHourlyCycle('mcp');
+  assert.equal(requests.length, 6); assert.equal(control().daily_attempts, 6); assert.equal(value.revision, automaticRevision);
+}));
+test('failed primary scheduling and provider cooldown are not shortened to the next :35 boundary', async () => withCycleClock(async ({ now, advance }) => {
+  const hour = Math.floor(now() / 3600000) * 3600000 + 3600000;
+  advance(hour + 5 * 60000 - now());
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  let requests = 0; globalThis.fetch = async () => { requests++; return { ok: false, status: 429 }; };
+  value = await store.runHourlyCycle('service');
+  const lane = value.sync.hourly.lanes.direct;
+  assert.ok(lane.latestError); assert.ok(Date.parse(lane.latestNextRunAt) >= hour + 3600000);
+  assert.notEqual(lane.latestNextRunAt, new Date(hour + 35 * 60000).toISOString());
+  assert.equal(lane.latestNextAttemptAt, value.sync.hourly.providerNextAttemptAt);
+  assert.ok(Date.parse(value.sync.hourly.providerNextAttemptAt) > now());
+  const deadlines = [lane.latestNextRunAt, lane.latestNextAttemptAt, value.sync.hourly.providerNextAttemptAt];
+  const revision = value.revision; value = await store.runHourlyCycle('mcp');
+  assert.deepEqual([value.sync.hourly.lanes.direct.latestNextRunAt, value.sync.hourly.lanes.direct.latestNextAttemptAt, value.sync.hourly.providerNextAttemptAt], deadlines);
+  assert.equal(requests, 1); assert.equal(control().daily_attempts, 1); assert.equal(value.revision, revision);
+}));
+test('provider rate cooldown stops a cycle and a repeated invocation spends no further allowance', async () => withCycleClock(async () => {
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  let calls = 0; globalThis.fetch = async () => { calls++; return { ok: false, status: 429 }; };
+  value = await store.runHourlyCycle('service');
+  assert.equal(calls, 1); assert.equal(control().daily_attempts, 1); assert.equal(value.sync.hourly.cycle.status, 'partial');
+  assert.equal(value.sync.hourly.cycle.stopCode, 'PROVIDER_COOLDOWN'); const revision = value.revision;
+  value = await store.runHourlyCycle('mcp'); assert.equal(calls, 1); assert.equal(value.revision, revision);
+  assert.equal(control().daily_attempts, 1); assert.equal(control().lease_token, null);
+}));
+test('status reads of due multi-lane collection never trigger or write a cycle', async () => withCycleClock(async () => {
+  fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+  const revision = value.revision; let calls = 0; globalThis.fetch = async () => { calls++; return emptyProvider(); };
+  const response = await internal.GET(); assert.equal(response.status, 200);
+  assert.equal((await response.json()).revision, revision); assert.equal((await store.getStatus()).revision, revision);
+  assert.equal(calls, 0); assert.equal(control().daily_attempts, 0); assert.equal(control().revision, revision);
+}));

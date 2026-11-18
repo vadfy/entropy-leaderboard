@@ -1,4 +1,4 @@
-import { getStatus, runSync, runHourlyCatchup, runMetricsRefresh, runPostRepair, WorkbenchError } from '../../../lib/workbench';
+import { getStatus, runHourlyCycle, runHourlyCatchup, runMetricsRefresh, runPostRepair, WorkbenchError } from '../../../lib/workbench';
 
 export const dynamic = 'force-dynamic';
 const LIMIT = 1024;
@@ -48,10 +48,10 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const { action, ids } = await checkRequest(request);
-    // Ordinary {} always checks the newest hourly window. A bounded explicit
-    // continuation never replaces that slot or enables/resumes collection.
+    // The existing unattended {} entrypoint checks every fresh lane. Historical
+    // maintenance remains explicit and cannot replace those primary slots.
     const result = action === 'catchup' ? await runHourlyCatchup() : action === 'metrics' ? await runMetricsRefresh()
-      : action === 'repair' ? await runPostRepair(ids) : await runSync();
+      : action === 'repair' ? await runPostRepair(ids) : await runHourlyCycle('service');
     return response({ revision: result.revision, updatedAt: result.updatedAt, mode: result.mode,
       connection: result.connection, sync: result.sync, authors: result.dataset.authors.length, posts: result.dataset.posts.length });
   } catch (error) { return errorResponse(error); }
