@@ -75,6 +75,49 @@ test('all-post exclusions remove creator row and post text; empty current month 
   assert.equal(snapshot.public.defaultPeriod, '2026-11');
 });
 
+test('reply posts never enter the public snapshot, while replies received by an original remain a metric', () => {
+  const source = fixture();
+  Object.assign(source.dataset.posts[2], { isReply: true, inReplyToId: '1001', body: 'PRIVATE_IGNORED_REPLY' });
+  Object.assign(source.dataset.posts[3], { isReply: false, inReplyToId: '1004', body: 'PRIVATE_IGNORED_SELF_REPLY' });
+  source.dataset.posts.push(post('1005', '101', '2026-11-09', { isReply: true, inReplyToId: '1001', body: 'PRIVATE_IGNORED_THREAD_REPLY' }));
+  source.dataset.posts[0].metrics.replies = 27;
+  source.dataset.posts[1].isQuote = true;
+  // Restoring a prior manual exclusion does not override the automatic policy.
+  source.state.postExclusions['1005'] = { ...decision, authorId: '101' };
+  delete source.state.postExclusions['1005'];
+  const snapshot = projectCommunitySnapshot(source, now), rows = allRows(snapshot);
+  assert.deepEqual(rows.map(row => row.author.id), ['101']);
+  assert.equal(rows[0].posts, 2); assert.equal(rows[0].metrics.impressions, 20000);
+  assert.equal(rows[0].metrics.replies, 30); assert.ok(rows[0].score > 0);
+  assert.deepEqual(new Set(snapshot.public.posts.map(item => item.id)), new Set(['1001', '1002']));
+  assert.equal(snapshot.public.posts.find(item => item.id === '1001').metrics.replies, 27);
+  assert.ok(!JSON.stringify(snapshot).includes('PRIVATE_IGNORED'));
+  assert.equal(source.dataset.posts.length, 5); // Source history is preserved.
+});
+
+test('untagged matches require accepted relevance or an explicit private review, without exposing review evidence', () => {
+  const source = fixture();
+  const relevance = status => ({ version: 'entropy-context-v1', status,
+    reasonCodes: [status === 'accepted' ? 'DIRECT_MENTION' : status === 'review' ? 'AMBIGUOUS_ENTROPY' : 'NO_PROJECT_EVIDENCE'],
+    signals: status === 'accepted' ? ['direct_mention'] : status === 'review' ? ['brand_name'] : [] });
+  Object.assign(source.dataset.posts[0], { body: 'PRIVATE_PENDING_ENTROPY', relevance: relevance('review') });
+  Object.assign(source.dataset.posts[1], { body: 'PRIVATE_UNRELATED_ENTROPY', relevance: relevance('rejected') });
+  source.dataset.posts[2].relevance = relevance('accepted');
+  source.dataset.posts[3].relevance = relevance('review');
+  source.state.postRelevance['1004'] = { ...decision, authorId: '103', action: 'approve' };
+  let snapshot = projectCommunitySnapshot(source, now);
+  assert.deepEqual(new Set(snapshot.public.posts.map(post => post.id)), new Set(['1003', '1004']));
+  assert.deepEqual(new Set(allRows(snapshot).map(row => row.author.id)), new Set(['102', '103']));
+  assert.ok(!JSON.stringify(snapshot).includes('PRIVATE_'));
+  assert.ok(!JSON.stringify(snapshot).includes('relevance'));
+  source.state.postRelevance['1003'] = { ...decision, authorId: '102', action: 'reject' };
+  // A later strong observation cannot reverse the moderator's saved rejection.
+  snapshot = projectCommunitySnapshot(source, now);
+  assert.deepEqual(snapshot.public.posts.map(post => post.id), ['1004']);
+  source.dataset.posts[3].isReply = true;
+  assert.deepEqual(projectCommunitySnapshot(source, now).public.posts, []);
+});
+
 test('calendar UTC periods replace research window and rankings use views with deterministic ties and unknowns last', () => {
   const source = fixture();
   source.dataset.posts = [post('1001', '101', '2026-10-30', { metrics: metrics(null) }), post('1002', '102', '2026-10-31'), post('1003', '103', '2026-10-31')];

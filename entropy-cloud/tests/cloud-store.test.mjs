@@ -77,6 +77,30 @@ test('state writes use strong CAS; competing edits cannot overwrite each other',
   const current = await store.getWorkbench(); assert.equal(current.revision, 1); assert.equal(Object.keys(current.state.bans).length, 1);
   await assert.rejects(store.saveState(first.state, 0, 'owner'), error => error.code === 'CONFLICT');
 });
+
+test('private relevance decisions persist by post ID and gain server actor attribution', async () => {
+  let value = await store.getWorkbench();
+  const post = value.dataset.posts[0], state = structuredClone(value.state);
+  state.postRelevance[post.id] = { action: 'approve', authorId: post.authorId, reason: 'Confirmed the Entropy context', internalNote: 'PRIVATE_RELEVANCE_NOTE', at: new Date().toISOString() };
+  state.audit.unshift({ id: 'event:relevance', type: 'approve-relevance', postId: post.id, authorId: post.authorId, reason: 'Confirmed the Entropy context', internalNote: 'PRIVATE_RELEVANCE_NOTE', at: new Date().toISOString() });
+  value = await store.saveState(state, value.revision, 'PRIVATE_REVIEWER_ID');
+  const reloaded = await store.getWorkbench();
+  assert.deepEqual(reloaded.state.postRelevance, value.state.postRelevance);
+  assert.equal(reloaded.state.postRelevance[post.id].action, 'approve');
+  assert.equal(reloaded.state.audit[0].actorUserId, 'PRIVATE_REVIEWER_ID');
+  assert.ok(sqlite.prepare('SELECT count(*) n FROM entropy_records WHERE generation=? AND kind=?').get(control().generation, 'state:postRelevance').n > 0);
+  assert.ok(!JSON.stringify(await store.getCommunityPreview()).includes('PRIVATE_'));
+});
+
+test('replacement cannot make an unreviewed match eligible by stripping its relevance facts', async () => {
+  let value = await store.getWorkbench(), dataset = structuredClone(value.dataset);
+  dataset.posts[0].relevance = { version: 'entropy-context-v1', status: 'review', reasonCodes: ['AMBIGUOUS_ENTROPY'], signals: ['brand_name'] };
+  value = await store.importWorkbench({ dataset, expectedRevision: value.revision });
+  const replacement = structuredClone(value.dataset); delete replacement.posts[0].relevance;
+  value = await store.importWorkbench({ dataset: replacement, expectedRevision: value.revision });
+  assert.equal(value.dataset.posts[0].relevance.status, 'review');
+  assert.ok(!(await store.getCommunityPreview()).public.posts.some(post => post.id === dataset.posts[0].id));
+});
 test('enabling requires a server secret; neither normal responses nor backups receive it', async () => {
   const first = await store.getWorkbench();
   await assert.rejects(store.setCollector(true, first.revision), error => error.code === 'KEY_REQUIRED');
@@ -223,6 +247,28 @@ test('imports require stopped collection and reset checkpoints without resetting
   assert.equal(result.sync.enabled, false); assert.deepEqual(result.sync.discovery.pendingWindows, []); assert.equal(result.sync.discovery.coveredThrough, null);
   assert.equal(result.sync.lastSuccessAt, null); assert.equal(result.sync.attemptBudget.count, 17); assert.equal(control().daily_attempts, 17);
 });
+test('replacement imports retain known reply and repost facts for the same post IDs without losing decisions', async () => {
+  let value = await store.getWorkbench(), dataset = structuredClone(value.dataset);
+  const [reply, parentOnlyReply, repost, original] = dataset.posts;
+  reply.isReply = true;
+  parentOnlyReply.isReply = false; parentOnlyReply.inReplyToId = '1900000000000000000';
+  repost.isRepost = true;
+  value = await store.importWorkbench({ dataset, expectedRevision: value.revision });
+  const state = structuredClone(value.state);
+  state.postExclusions[reply.id] = { authorId: reply.authorId, reason: 'Existing decision', at: new Date().toISOString() };
+  value = await store.saveState(state, value.revision, 'owner');
+  dataset = structuredClone(value.dataset);
+  for (const post of dataset.posts) { post.isReply = false; delete post.inReplyToId; post.isRepost = false; }
+  value = await store.importWorkbench({ dataset, expectedRevision: value.revision });
+  const byId = new Map(value.dataset.posts.map(post => [post.id, post]));
+  assert.equal(byId.get(reply.id).isReply, true);
+  assert.equal(byId.get(parentOnlyReply.id).isReply, true);
+  assert.equal(byId.get(parentOnlyReply.id).inReplyToId, '1900000000000000000');
+  assert.equal(byId.get(repost.id).isRepost, true);
+  assert.equal(byId.get(original.id).isReply, false);
+  assert.equal(value.state.postExclusions[reply.id].reason, 'Existing decision');
+  assert.equal(value.dataset.posts.length, 24); assert.equal(control().daily_attempts, 0);
+});
 test('post-proven identity upgrades preserve bans; browser state writes cannot erase the evidence ledger', async () => {
   let value = await store.getWorkbench();
   const oldAuthor = value.dataset.authors[0], realId = '1234567890123456789';
@@ -294,6 +340,11 @@ test('private service writer rejects malformed intent, origin, type and bounded 
     [internalRequest('{"force":true}'), 400],
     [internalRequest('{"action":"unknown"}'), 400],
     [internalRequest('{"action":"catchup","force":true}'), 400],
+    [internalRequest('{"action":"repair","ids":[]}'), 400],
+    [internalRequest('{"action":"repair","ids":["not-an-id"]}'), 400],
+    [internalRequest('{"action":"repair","ids":["123","123"]}'), 400],
+    [internalRequest('{"action":"repair","ids":["123"],"force":true}'), 400],
+    [internalRequest(JSON.stringify({ action: 'repair', ids: Array.from({ length: 21 }, (_, i) => String(100 + i)) })), 400],
   ];
   for (const [request, status] of cases) {
     const result = await internal.POST(request); assert.equal(result.status, status);
@@ -388,9 +439,35 @@ function backfillRequest(payload, headers = {}) {
     body: typeof payload === 'string' ? payload : JSON.stringify(payload) });
 }
 const historicalRange = (now = Date.now(), requestLimit = 250) => ({
-  start: new Date(now - 2 * 86400000).toISOString(), endExclusive: new Date(now - 1000).toISOString(), requestLimit,
+  start: new Date(now - 2 * 86400000).toISOString(), endExclusive: new Date(now - 1000).toISOString(), requestLimit, lanes: ['direct'],
 });
 const emptySearchPage = () => ({ ok: true, status: 200, json: async () => ({ status: 'success', tweets: [], has_next_page: false, next_cursor: '' }) });
+test('default history scans all three lanes independently and validates explicit lane scope before reserving attempts', async () => {
+  const clock = Date.now; let now = Date.parse('2026-11-18T12:20:00Z'); Date.now = () => now;
+  try {
+    fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+    const range = { start: '2026-11-18T11:20:00Z', endExclusive: '2026-11-18T12:19:00Z', requestLimit: 10 };
+    for (const lanes of [[], ['other'], ['direct', 'direct'], ['direct', 'evidence', 'context', 'other']])
+      await assert.rejects(store.startBackfill({ ...range, lanes }), error => error.code === 'INVALID_INPUT');
+    assert.equal(control().daily_attempts, 0);
+    value = await store.startBackfill(range);
+    assert.deepEqual(value.sync.backfill.lanes, ['direct', 'evidence', 'context']);
+    assert.equal(value.sync.backfill.pendingWindows.length, 3);
+    const queries = [];
+    globalThis.fetch = async url => { queries.push(new URL(url).searchParams.get('query')); return emptySearchPage(); };
+    for (let step = 0; step < 3; step++) {
+      now += 6000; value = await store.runBackfill();
+      assert.equal(value.sync.backfill.requestCount, step + 1);
+      if (step < 2) assert.notEqual(value.sync.backfill.status, 'complete');
+    }
+    assert.equal(value.sync.backfill.status, 'complete');
+    assert.equal(value.sync.backfill.pendingWindows.length, 0);
+    assert.ok(queries.some(query => query.startsWith('@entropyIO ')));
+    assert.ok(queries.some(query => query.startsWith('(url:entropy.io ')));
+    assert.ok(queries.some(query => query.startsWith('Entropy ')));
+    assert.equal(control().daily_attempts, 3);
+  } finally { Date.now = clock; }
+});
 test('historical jobs require a key and enabled collection, validate a fixed cutoff, and start idempotently without paid calls', async () => {
   const range = historicalRange(); const value = await store.getWorkbench();
   await assert.rejects(store.startBackfill(range), error => error.code === 'KEY_REQUIRED');
@@ -415,8 +492,8 @@ test('accelerated steps preserve their own progress while hourly discovery keeps
       calls++; assert.equal(control().daily_attempts, calls); assert.ok(control().lease_token); assert.ok(control().lease_until > now);
       if (calls === 1) {
         assert.equal(new URL(url).pathname, '/twitter/tweet/advanced_search');
-        assert.ok(new URL(url).searchParams.get('query').startsWith('@entropyIO since_time:'));
-      } else assert.equal(new URL(url).pathname, '/twitter/user/mentions');
+        assertTweetOnlySearch(url);
+      } else assertTweetOnlySearch(url);
       return emptySearchPage();
     };
     const early = await store.runBackfill(); assert.equal(early.revision, value.revision); assert.ok(Date.parse(early.sync.backfill.nextStepAt) > now);
@@ -437,8 +514,8 @@ test('historical daily cap and stopped jobs never access the provider; only an e
   try {
     fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
     const range = historicalRange(base, 1); value = await store.startBackfill(range); now += 6000;
-    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=288').run(new Date(now).toISOString().slice(0, 10));
-    await assert.rejects(store.runBackfill(), error => error.code === 'DAILY_LIMIT');
+    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=264').run(new Date(now).toISOString().slice(0, 10));
+    await assert.rejects(store.runBackfill(), error => error.code === 'FRESH_DISCOVERY_RESERVE');
     sqlite.prepare('UPDATE entropy_control SET daily_attempts=0').run();
     let calls = 0; globalThis.fetch = async () => { calls++; return emptySearchPage(); };
     const limited = await store.runBackfill(); assert.equal(limited.sync.backfill.status, 'request-limit'); assert.equal(calls, 1);
@@ -448,6 +525,42 @@ test('historical daily cap and stopped jobs never access the provider; only an e
     assert.equal(control().daily_attempts, 1); now += 6000;
     await store.runBackfill(); assert.equal(calls, 2);
   } finally { Date.now = clock; }
+});
+test('historical collection stops at the fresh-discovery reserve, including a racing allowance claim', async () => {
+  const clock = Date.now; let now = hourlyClockStart(); Date.now = () => now;
+  try {
+    fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
+    await store.startBackfill(historicalRange(now)); now += 6000;
+    const today = new Date(now).toISOString().slice(0, 10);
+    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=263').run(today);
+    let calls = 0; globalThis.fetch = async () => { calls++; return emptySearchPage(); };
+    value = await store.runBackfill(); assert.equal(calls, 1); assert.equal(control().daily_attempts, 264);
+    now += 6000;
+    await assert.rejects(store.runBackfill(), error => error.code === 'FRESH_DISCOVERY_RESERVE');
+    assert.equal(calls, 1); assert.equal(control().daily_attempts, 264);
+    await store.runSync(undefined, true); assert.equal(calls, 2); assert.equal(control().daily_attempts, 265);
+    now += 6000;
+    sqlite.prepare('UPDATE entropy_control SET daily_attempts=263').run();
+    let raced = false;
+    scope.DB = { ...database, prepare(sql) {
+      const statement = database.prepare(sql);
+      if (sql.startsWith('UPDATE entropy_control SET lease_token=') && sql.includes('daily_attempts=CASE')) {
+        const bind = statement.bind.bind(statement);
+        statement.bind = (...args) => {
+          const bound = bind(...args), run = bound.run.bind(bound);
+          bound.run = async () => {
+            raced = true; sqlite.prepare('UPDATE entropy_control SET daily_attempts=264').run();
+            return run();
+          };
+          return bound;
+        };
+      }
+      return statement;
+    } };
+    await assert.rejects(store.runBackfill(), error => error.code === 'FRESH_DISCOVERY_RESERVE');
+    assert.equal(raced, true); assert.equal(calls, 2); assert.equal(control().daily_attempts, 264);
+    assert.equal(control().lease_token, null);
+  } finally { scope.DB = database; Date.now = clock; }
 });
 test('historical auth failures pause without leaking response contents or restarting on hourly ticks', async () => {
   const clock = Date.now, base = Date.now(); let now = base;
@@ -557,11 +670,151 @@ function discoveryTweet(now, id = '1900000000000000001', age = 60000) {
 function discoveryResponse(tweets, hasNextPage = false, cursor = '') {
   return { ok: true, status: 200, json: async () => ({ status: 'success', tweets, has_next_page: hasNextPage, next_cursor: cursor }) };
 }
+function assertTweetOnlySearch(url) {
+  const target = new URL(url), query = target.searchParams.get('query');
+  assert.equal(target.pathname, '/twitter/tweet/advanced_search');
+  assert.ok(query.startsWith('@entropyIO ')); assert.ok(query.includes('-filter:replies'));
+  assert.ok(query.includes('-filter:nativeretweets')); assert.match(query, /since_time:\d+ until_time:\d+/);
+  assert.equal(target.searchParams.get('queryType'), 'Latest');
+  return query;
+}
+function assertDiscoveryUnchanged(actual, expected) {
+  // Maintenance deadlines derive from the latest commit's spacing, so a
+  // metrics commit may move them without changing discovery checkpoints.
+  const stable = ({ nextAttemptAt, catchupNextAttemptAt, ...rest }) => rest;
+  assert.deepEqual(stable(actual), stable(expected));
+  assert.ok(Date.parse(actual.nextAttemptAt) >= Date.parse(expected.nextAttemptAt));
+  assert.equal(actual.catchupNextAttemptAt, actual.nextAttemptAt);
+}
 function patchSyncFixture(patch) {
   const row = sqlite.prepare('SELECT payload FROM entropy_records WHERE generation=? AND kind=? AND record_id=? AND chunk_index=0').get(control().generation, 'sync', 'main');
   const sync = { ...JSON.parse(row.payload), ...patch };
   sqlite.prepare('UPDATE entropy_records SET payload=? WHERE generation=? AND kind=? AND record_id=? AND chunk_index=0').run(JSON.stringify(sync), control().generation, 'sync', 'main');
 }
+test('owner link recovery accepts untagged official evidence and quarantines ambiguous Entropy posts', async () => {
+  const clock = Date.now; let now = hourlyClockStart(); Date.now = () => now;
+  try {
+    fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision); now += 6000;
+    const ids = ['1900000000000000101', '1900000000000000102', '1900000000000000103', '1900000000000000104'];
+    const linked = { ...discoveryTweet(now, ids[0]), text: 'This new exchange is worth trying https://t.co/example', entities: { urls: [{ expanded_url: 'https://pro.entropy.io/?r=creator' }] } };
+    const quoted = { ...discoveryTweet(now, ids[1]), text: 'A useful community announcement', quoted_tweet: { id: '2122649707138965603', author: { userName: 'entropyIO' } } };
+    const pending = { ...discoveryTweet(now, ids[2]), text: 'PRIVATE_PENDING: Entropy might be early' };
+    const unrelated = { ...discoveryTweet(now, ids[3]), text: 'Entropy custody news https://entropy.xyz/' };
+    let calls = 0; globalThis.fetch = async () => { calls++; return discoveryResponse([linked, quoted, pending, unrelated]); };
+    const noIdentity = new Request('https://entropy.example/api/repair', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://entropy.example' }, body: JSON.stringify({ ids, expectedRevision: value.revision }) });
+    assert.equal((await api.POST(noIdentity, context('repair'))).status, 401);
+    assert.equal((await api.POST(browserRequest('repair', { ids }), context('repair'))).status, 400);
+    assert.equal((await api.POST(browserRequest('repair', { ids, expectedRevision: value.revision - 1 }), context('repair'))).status, 409);
+    assert.equal(calls, 0);
+    const response = await api.POST(browserRequest('repair', { ids, expectedRevision: value.revision }), context('repair'));
+    assert.equal(response.status, 200); value = await response.json();
+    assert.equal(calls, 1); assert.equal(value.sync.postRepair.accepted, 2); assert.equal(value.sync.postRepair.queuedForReview, 1);
+    assert.equal(value.sync.postRepair.notRelevant, 1); assert.equal(value.sync.postRepair.addedPosts, 3);
+    const stored = await store.getWorkbench();
+    assert.equal(stored.dataset.posts.find(post => post.id === ids[2]).relevance.status, 'review');
+    let publicSnapshot = await store.getCommunityPreview();
+    assert.ok(publicSnapshot.public.posts.some(post => post.id === ids[0]));
+    assert.ok(publicSnapshot.public.posts.some(post => post.id === ids[1]));
+    assert.ok(!publicSnapshot.public.posts.some(post => [ids[2], ids[3]].includes(post.id)));
+    assert.ok(!JSON.stringify(publicSnapshot).includes('PRIVATE_PENDING'));
+    const reviewed = structuredClone(stored.state);
+    reviewed.postRelevance[ids[2]] = { action: 'approve', authorId: pending.author.id, reason: 'Confirmed the project manually', internalNote: 'PRIVATE_REVIEW_NOTE', at: new Date(now).toISOString() };
+    await store.saveState(reviewed, stored.revision, 'owner');
+    publicSnapshot = await store.getCommunityPreview();
+    assert.ok(publicSnapshot.public.posts.some(post => post.id === ids[2]));
+    assert.ok(!JSON.stringify(publicSnapshot).includes('PRIVATE_REVIEW_NOTE'));
+  } finally { Date.now = clock; }
+});
+test('exact-ID recovery adds only owned direct mentions, retaining moderation and hourly checkpoints', async () => {
+  const clock = Date.now; let now = hourlyClockStart(); Date.now = () => now;
+  try {
+    fakeKey(); let value = await store.getWorkbench();
+    const state = structuredClone(value.state), authorId = value.dataset.authors[0].id;
+    state.bans[authorId] = { reason: 'Keep existing decision', internalNote: 'PRIVATE_REPAIR_NOTE', at: new Date(now).toISOString() };
+    value = await store.saveState(state, value.revision, 'owner'); value = await store.setCollector(true, value.revision);
+    const hourly = { nextRunAt: new Date(now + 3600000).toISOString(), lastSuccessAt: new Date(now - 1000).toISOString(), pendingWindows: [] };
+    patchSyncFixture({ hourly }); now += 6000;
+    const ids = Array.from({ length: 6 }, (_, i) => '190000000000000000' + (i + 1));
+    const first = discoveryTweet(now, ids[0], 2 * 86400000);
+    first.text = 'Original post about @entropyIO with the complete long body.'; first.isReply = false;
+    const quote = { ...discoveryTweet(now, ids[1]), quoted_tweet: { text: 'Quoted context' }, isReply: false };
+    const reply = { ...discoveryTweet(now, ids[2]), isReply: false, inReplyToId: ids[0] };
+    const repost = { ...discoveryTweet(now, ids[3]), isRetweet: true };
+    const unrelated = { ...discoveryTweet(now, ids[4]), text: 'A post on another topic', quoted_tweet: { text: '@entropyIO' } };
+    let calls = 0;
+    globalThis.fetch = async url => {
+      calls++; const target = new URL(url);
+      assert.equal(target.pathname, '/twitter/tweets'); assert.deepEqual(target.searchParams.get('tweet_ids').split(','), ids);
+      assert.equal(control().daily_attempts, 1); assert.ok(control().lease_token);
+      return discoveryResponse([first, quote, reply, repost, unrelated]);
+    };
+    const response = await internal.POST(internalRequest(JSON.stringify({ action: 'repair', ids })));
+    assert.equal(response.status, 200); const summary = await response.json();
+    assert.deepEqual(summary.sync.postRepair, { status: 'complete', requested: 6, returned: 5, matched: 2, accepted: 2, queuedForReview: 0, addedPosts: 2,
+      ignoredReplies: 1, ignoredReposts: 1, notRelevant: 1, unavailable: 1,
+      lastAttemptAt: new Date(now).toISOString(), lastSuccessAt: new Date(now).toISOString(), nextAttemptAt: null, lastError: null });
+    assert.equal(summary.posts, 26); assert.equal(calls, 1); assert.ok(!('dataset' in summary)); assert.ok(!('state' in summary));
+    assert.ok(!JSON.stringify(summary).includes('PRIVATE_')); assert.ok(!JSON.stringify(summary).includes(scope.TWITTERAPI_IO_KEY));
+    value = await store.getWorkbench();
+    assert.ok(value.dataset.posts.some(post => post.id === ids[0] && post.body === first.text));
+    assert.ok(value.dataset.posts.some(post => post.id === ids[1]));
+    assert.ok(!value.dataset.posts.some(post => ids.slice(2).includes(post.id)));
+    assert.equal(value.state.bans[authorId].internalNote, 'PRIVATE_REPAIR_NOTE'); assert.deepEqual(value.sync.hourly.pendingWindows, []);
+    assert.equal(value.sync.hourly.lastSuccessAt, hourly.lastSuccessAt); assert.equal(value.sync.hourly.nextRunAt, hourly.nextRunAt);
+    assert.equal(control().daily_attempts, 1); assert.equal(control().lease_token, null);
+    await assert.rejects(store.runPostRepair(ids), error => error.code === 'REPAIR_NOT_DUE'); assert.equal(calls, 1);
+  } finally { Date.now = clock; }
+});
+test('exact-ID recovery respects disabled collection, fresh reserve, and redacts provider failures', async () => {
+  const clock = Date.now; let now = hourlyClockStart(); Date.now = () => now;
+  const ids = ['1900000000000000001'];
+  try {
+    await assert.rejects(store.runPostRepair([]), error => error.code === 'INVALID_INPUT');
+    assert.equal(sqlite.prepare('SELECT count(*) n FROM entropy_control').get().n, 0);
+    let value = await store.getWorkbench(); fakeKey();
+    await assert.rejects(store.runPostRepair(ids), error => error.code === 'COLLECTOR_DISABLED');
+    value = await store.setCollector(true, value.revision); now += 6000;
+    sqlite.prepare('UPDATE entropy_control SET daily_date=?,daily_attempts=264').run(new Date(now).toISOString().slice(0, 10));
+    await assert.rejects(store.runPostRepair(ids), error => error.code === 'FRESH_DISCOVERY_RESERVE');
+    sqlite.prepare('UPDATE entropy_control SET daily_attempts=0').run();
+    let calls = 0; globalThis.fetch = async () => { calls++; return { ok: false, status: 402, json: async () => ({ secret: scope.TWITTERAPI_IO_KEY }) }; };
+    value = await store.runPostRepair(ids);
+    assert.equal(value.sync.paused, true); assert.equal(value.sync.postRepair.lastError.code, 'CREDITS_EXHAUSTED');
+    assert.equal(value.dataset.posts.length, 24); assert.equal(calls, 1); assert.equal(control().daily_attempts, 1); assert.equal(control().lease_token, null);
+    assert.ok(!JSON.stringify(value).includes(scope.TWITTERAPI_IO_KEY));
+    await assert.rejects(store.runPostRepair(ids), error => error.code === 'COLLECTOR_PAUSED'); assert.equal(calls, 1);
+  } finally { Date.now = clock; }
+});
+test('exact-ID recovery classifies existing untyped replies without adding new replies or erasing moderation', async () => {
+  const clock = Date.now; let now = hourlyClockStart(); Date.now = () => now;
+  try {
+    let value = await store.getWorkbench(); const existing = value.dataset.posts[0];
+    const author = value.dataset.authors.find(author => author.id === existing.authorId);
+    assert.notEqual(existing.isReply, true); assert.ok(!existing.inReplyToId);
+    const state = structuredClone(value.state);
+    state.postExclusions[existing.id] = { authorId: existing.authorId, reason: 'Keep manual reason', at: new Date(now).toISOString() };
+    value = await store.saveState(state, value.revision, 'owner');
+    fakeKey(); value = await store.setCollector(true, value.revision); now += 6000;
+    const newReplyId = '1900000000000000002';
+    const rawExisting = { ...discoveryTweet(now, existing.id), isReply: false, inReplyToId: '1900000000000000000',
+      author: { id: '1000000000000000001', userName: author.handle.replace(/^@/, ''), followers: 10 } };
+    const rawNewReply = { ...discoveryTweet(now, newReplyId), isReply: true,
+      author: { id: '1000000000000000002', userName: 'newreplyauthor', followers: 2 } };
+    globalThis.fetch = async () => discoveryResponse([rawExisting, rawNewReply]);
+    value = await store.runPostRepair([existing.id, newReplyId]);
+    const classified = value.dataset.posts.find(post => post.id === existing.id);
+    assert.equal(classified.isReply, true); assert.equal(classified.inReplyToId, '1900000000000000000');
+    assert.equal(classified.authorId, existing.authorId); assert.equal(value.dataset.posts.length, 24);
+    assert.ok(!value.dataset.posts.some(post => post.id === newReplyId));
+    assert.equal(value.state.postExclusions[existing.id].reason, 'Keep manual reason');
+    assert.equal(value.sync.postRepair.accepted, 0); assert.equal(value.sync.postRepair.ignoredReplies, 2);
+    const restored = structuredClone(value.state); delete restored.postExclusions[existing.id];
+    value = await store.saveState(restored, value.revision, 'owner');
+    const snapshot = await store.getCommunityPreview();
+    assert.ok(!snapshot.public.posts.some(post => post.id === existing.id));
+    assert.equal(control().daily_attempts, 1);
+  } finally { Date.now = clock; }
+});
 test('hourly discovery checks new mentions even with a metrics backlog and preserves moderation', async () => {
   const clock = Date.now; let now = hourlyClockStart(); Date.now = () => now;
   try {
@@ -573,9 +826,8 @@ test('hourly discovery checks new mentions even with a metrics backlog and prese
     patchSyncFixture({ phase: 'refresh', refresh: { pendingIds, cycleStartedAt: new Date(now).toISOString() } });
     let calls = 0;
     globalThis.fetch = async url => {
-      calls++; const target = new URL(url); assert.equal(target.pathname, '/twitter/user/mentions');
-      assert.equal(target.searchParams.get('userName'), 'entropyIO');
-      assert.ok(Number(target.searchParams.get('untilTime')) * 1000 <= now);
+      calls++; const query = assertTweetOnlySearch(url);
+      assert.ok(Number(query.match(/until_time:(\d+)/)[1]) * 1000 <= now);
       return discoveryResponse([discoveryTweet(now)]);
     };
     const result = await store.runSync(undefined, true);
@@ -602,11 +854,12 @@ test('catch-up durably reserves one continuation page without moving the next ho
     };
     const early = await store.runHourlyCatchup(); assert.equal(early.revision, latest.revision); assert.equal(calls, 0);
     now += 6000; const result = await store.runHourlyCatchup();
-    assert.equal(calls, 1); assert.equal(result.dataset.posts.length, 26); assert.equal(result.sync.hourly.pendingWindows.length, 0);
+    assert.equal(calls, 1); assert.equal(result.dataset.posts.length, 26);
+    assert.ok(!result.sync.hourly.pendingWindows.some(window => window.cursor === 'next-A'));
     assert.equal(result.sync.hourly.nextRunAt, nextRun); assert.equal(result.sync.nextRunAt, nextRun);
     assert.equal(result.sync.hourly.lastSuccessAt, lastSuccess); assert.ok(result.sync.hourly.catchupLastSuccessAt);
     assert.equal(control().lease_token, null); assert.equal(control().daily_attempts, 2);
-    await store.runHourlyCatchup(); assert.equal(calls, 1);
+    const after = await store.getWorkbench(); assert.equal(after.sync.hourly.nextRunAt, nextRun);
   } finally { Date.now = clock; }
 });
 test('catch-up serializes with new discovery and never exposes its lease token', { timeout: 5000 }, async () => {
@@ -648,7 +901,7 @@ test('metrics maintenance adapts failed batches and keeps every queued ID withou
     fakeKey(); let value = await store.getWorkbench(); value = await store.setCollector(true, value.revision);
     const ids = new Set(value.dataset.posts.map(post => post.id)), requestedSizes = [];
     for (let attempt = 0; attempt < 2; attempt++) {
-      globalThis.fetch = async url => { assert.equal(new URL(url).pathname, '/twitter/user/mentions'); return discoveryResponse([]); };
+      globalThis.fetch = async url => { assertTweetOnlySearch(url); return discoveryResponse([]); };
       value = await store.runSync(undefined, true);
       const latest = structuredClone(value.sync.hourly), nextRun = value.sync.nextRunAt; now += 6000;
       globalThis.fetch = async url => {
@@ -660,12 +913,39 @@ test('metrics maintenance adapts failed batches and keeps every queued ID withou
       assert.equal(value.sync.metricsRefresh.lastError.diagnosticCode, 'REQUEST_TIMEOUT');
       assert.equal(value.sync.metricsRefresh.batchSize, attempt ? 5 : 10);
       assert.equal(value.sync.metricsRefresh.pendingCount, ids.size);
-      assert.deepEqual(new Set(value.sync.refresh.pendingIds), ids); assert.deepEqual(value.sync.hourly, latest);
+      assert.deepEqual(new Set(value.sync.refresh.pendingIds), ids); assertDiscoveryUnchanged(value.sync.hourly, latest);
       assert.equal(value.sync.nextRunAt, nextRun); assert.equal(value.dataset.posts.length, ids.size);
       assert.equal(value.sync.paused, false); assert.ok(!JSON.stringify(value).includes(scope.TWITTERAPI_IO_KEY));
       now = Date.parse(value.sync.hourly.nextRunAt) + 1000;
     }
     assert.deepEqual(requestedSizes, [20, 10]);
+  } finally { Date.now = clock; }
+});
+test('metrics maintenance prunes saved reply and repost IDs from its queue while retaining original and quote posts', async () => {
+  const clock = Date.now; let now = hourlyClockStart(); Date.now = () => now;
+  try {
+    let value = await store.getWorkbench(), dataset = structuredClone(value.dataset);
+    dataset.posts[0].isReply = true;
+    dataset.posts[1].isReply = false; dataset.posts[1].inReplyToId = '1900000000000000000';
+    dataset.posts[2].isRepost = true;
+    dataset.posts[3].isQuote = true;
+    const ignored = new Set(dataset.posts.slice(0, 3).map(post => post.id)), quoteId = dataset.posts[3].id;
+    value = await store.importWorkbench({ dataset, expectedRevision: value.revision });
+    fakeKey(); value = await store.setCollector(true, value.revision);
+    globalThis.fetch = async () => discoveryResponse([]); value = await store.runSync(undefined, true);
+    patchSyncFixture({ refresh: { pendingIds: value.dataset.posts.map(post => post.id) } }); now += 6000;
+    let requested;
+    globalThis.fetch = async url => {
+      const target = new URL(url); assert.equal(target.pathname, '/twitter/tweets');
+      requested = target.searchParams.get('tweet_ids').split(','); return discoveryResponse([]);
+    };
+    value = await store.runMetricsRefresh();
+    assert.equal(requested.length, 20); assert.ok(requested.includes(quoteId));
+    assert.ok(requested.every(id => !ignored.has(id)));
+    assert.ok(value.sync.refresh.pendingIds.every(id => !ignored.has(id)));
+    assert.equal(value.sync.metricsRefresh.pendingCount, 1); assert.equal(value.dataset.posts.length, 24);
+    assert.equal(value.dataset.posts.find(post => post.id === dataset.posts[0].id).isReply, true);
+    assert.equal(control().daily_attempts, 2);
   } finally { Date.now = clock; }
 });
 test('private maintenance actions remain disabled without collection and whitelist response contents', async () => {
@@ -695,7 +975,7 @@ test('successful metrics maintenance advances only its selected IDs and preserve
     const result = await store.runMetricsRefresh();
     assert.equal(result.sync.metricsRefresh.lastSuccessAt, new Date(now).toISOString());
     assert.equal(result.sync.metricsRefresh.lastError, null); assert.equal(result.sync.metricsRefresh.pendingCount, 4);
-    assert.equal(result.sync.refresh.pendingIds.length, 4); assert.deepEqual(result.sync.hourly, hourly);
+    assert.equal(result.sync.refresh.pendingIds.length, 4); assertDiscoveryUnchanged(result.sync.hourly, hourly);
     assert.equal(result.sync.nextRunAt, nextRun); assert.equal(result.dataset.posts.length, before.posts.length);
     for (const post of before.posts) assert.deepEqual(result.dataset.posts.find(value => value.id === post.id).metrics, post.metrics);
     // A second call this hour is a read/no-op rather than another paid batch.
