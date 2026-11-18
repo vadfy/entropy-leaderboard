@@ -1,5 +1,6 @@
 import Model from './model.cjs';
 import { normalizeTweets } from './twitterapi.mjs';
+import { validatedRelevance } from './relevance.mjs';
 
 const TARGET = 'entropyIO';
 const DAY = 86400000;
@@ -9,6 +10,26 @@ const copy = value => JSON.parse(JSON.stringify(value));
 const numericId = value => typeof value === 'string' && /^[1-9]\d*$/.test(value);
 const known = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const timestamp = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null;
+export const DISCOVERY_QUERY_POLICY = 'entropy-context-v1';
+export const DISCOVERY_LANES = Object.freeze(['direct', 'evidence', 'context']);
+export function discoveryTerms(lane = 'direct', policy = DISCOVERY_QUERY_POLICY) {
+  if (!DISCOVERY_LANES.includes(lane)) throw new Error('Invalid discovery lane.');
+  if (policy !== DISCOVERY_QUERY_POLICY || lane === 'direct') return '@' + TARGET;
+  return lane === 'evidence' ? '(url:entropy.io OR "entropy.io" OR url:x.com/entropyIO OR url:twitter.com/entropyIO)' : 'Entropy';
+}
+export function discoveryQuery(start, endExclusive, policy = DISCOVERY_QUERY_POLICY, lane = 'direct') {
+  const filters = [DISCOVERY_QUERY_POLICY, 'original-tweets-v1'].includes(policy) ? ' -filter:replies -filter:nativeretweets' : '';
+  return discoveryTerms(lane, policy) + filters + ' since_time:' + Math.floor(Date.parse(start) / 1000) + ' until_time:' + Math.floor(Date.parse(endExclusive) / 1000);
+}
+
+function mergedRelevance(previous, incoming, body) {
+  const before = validatedRelevance(previous), after = validatedRelevance(incoming);
+  // Missing quote/link fields in a metrics response cannot erase saved proof.
+  if (before?.status === 'accepted' && after?.status !== 'accepted') return before;
+  if (before?.status === 'review' && (!after || after.status === 'rejected')) return before;
+  if ((!body || !body.trim()) && after?.status === 'rejected') return before;
+  return after || before;
+}
 
 function mergeDefined(oldValue, newValue) {
   const result = { ...(oldValue || {}) };
@@ -44,6 +65,13 @@ function mergePost(previous, incoming, oldAsOf, newAsOf) {
   }
   const times = Object.values(metricsObservedAt).filter(Boolean).sort((a, b) => Date.parse(a) - Date.parse(b));
   return { ...mergeDefined(previous, incoming), authorId: incoming.authorId,
+    relevance: mergedRelevance(previous.relevance, incoming.relevance, incoming.body),
+    discoveryLanes: [...new Set([...(previous.discoveryLanes || []), ...(incoming.discoveryLanes || [])])].filter(lane => DISCOVERY_LANES.includes(lane)),
+    // A partial provider observation cannot erase positive reply evidence.
+    isReply: previous.isReply === true || incoming.isReply === true ? true : incoming.isReply ?? previous.isReply ?? null,
+    inReplyToId: previous.inReplyToId || incoming.inReplyToId || null,
+    isRepost: Model.postEligibility({ ...previous, isReply: false, inReplyToId: null }).reason === 'repost' ||
+      Model.postEligibility({ ...incoming, isReply: false, inReplyToId: null }).reason === 'repost' ? true : incoming.isRepost ?? previous.isRepost ?? null,
     workId: previous.workId || incoming.workId || null,
     metrics, metricsObservedAt,
     // The oldest field timestamp prevents a partial refresh from relabelling old counts as fresh.
@@ -182,17 +210,34 @@ function directlyMentioned(tweet) {
   return /(^|[^A-Za-z0-9_])@entropyIO(?![A-Za-z0-9_])/i.test(typeof tweet.text === 'string' ? tweet.text : '') ||
     Array.isArray(tweet.entities?.user_mentions) && tweet.entities.user_mentions.some(m => typeof m?.screen_name === 'string' && m.screen_name.toLowerCase() === TARGET.toLowerCase());
 }
+function formatEligible(post) { return !['reply', 'repost'].includes(Model.postEligibility(post).reason); }
+export function matchesDiscoveryLane(post, lane = 'direct') {
+  if (!DISCOVERY_LANES.includes(lane)) return false;
+  if (Array.isArray(post.discoveryLanes) && post.discoveryLanes.includes(lane)) return true;
+  if (lane === 'direct') return directlyMentioned({ text: post.body }) || validatedRelevance(post.relevance)?.signals.includes('direct_mention') === true;
+  const relevance = validatedRelevance(post.relevance);
+  if (lane === 'evidence') return relevance?.signals.some(value => ['official_domain', 'official_post_link'].includes(value)) === true;
+  return /\bentropy\b/i.test(post.body || '');
+}
 function normalizedPage(tweets, nowIso, window = null) {
-  const data = normalizeTweets(tweets, { observedAt: nowIso, query: '@' + TARGET });
+  const data = normalizeTweets(tweets, { observedAt: nowIso, query: window?.query || '@' + TARGET });
   if (window) {
-    const mentionIds = new Set(tweets.filter(directlyMentioned).map(t => t.id));
     const from = Date.parse(window.start), until = Date.parse(window.endExclusive);
-    data.posts = data.posts.filter(p => mentionIds.has(p.id) && p.authorHandle.toLowerCase() !== TARGET.toLowerCase() && Date.parse(p.publishedAt) >= from && Date.parse(p.publishedAt) < until);
+    data.posts = data.posts.filter(p => formatEligible(p) && ['accepted', 'review'].includes(p.relevance?.status) && p.authorHandle.toLowerCase() !== TARGET.toLowerCase() && Date.parse(p.publishedAt) >= from && Date.parse(p.publishedAt) < until)
+      .map(post => ({ ...post, discoveryLanes: [window.discoveryLane || 'direct'] }));
     const authors = new Set(data.posts.map(p => p.authorId));
     data.authors = data.authors.filter(a => authors.has(a.id));
     data.meta.periodStart = window.start.slice(0, 10);
     data.meta.periodEndExclusive = new Date(Math.ceil(until / DAY) * DAY).toISOString().slice(0, 10);
   }
+  return data;
+}
+/** Shared discovery/repair defense. Ambiguous matches remain private review records. */
+export function normalizeDiscoveryPage(tweets, observedAt, window = null) {
+  const data = normalizedPage(tweets, observedAt, window);
+  data.posts = data.posts.filter(post => formatEligible(post) && ['accepted', 'review'].includes(post.relevance?.status) && post.authorHandle.toLowerCase() !== TARGET.toLowerCase());
+  const authors = new Set(data.posts.map(post => post.authorId));
+  data.authors = data.authors.filter(author => authors.has(author.id));
   return data;
 }
 // Emit only fixed diagnostic identifiers. Never persist provider text, IDs,
@@ -261,7 +306,9 @@ export async function advanceSync(workbench, { client, now, maxRequests = 1 } = 
   if (!client || typeof client.searchPage !== 'function' || typeof client.tweetsByIds !== 'function') throw new Error('A read-only provider client is required.');
 
   const discoveryLane = prepareDiscovery(sync, nowMs, nowIso);
-  const eligible = dataset.posts.filter(p => numericId(p.id));
+  const eligible = dataset.posts.filter(p => numericId(p.id) && (Model.countablePost ? Model.countablePost(p, state).eligible : Model.postEligibility(p).eligible && p.relevance?.status !== 'review'));
+  const eligibleIds = new Set(eligible.map(p => p.id));
+  sync.refresh.pendingIds = sync.refresh.pendingIds.filter(id => eligibleIds.has(id));
   if (sync.requestCount === 0 && eligible.some(p => p.authorId.startsWith('sample:'))) sync.phase = 'refresh';
   if (sync.phase === 'refresh' && !sync.refresh.pendingIds.length) {
     sync.refresh.pendingIds = [...eligible].sort((a, b) => (Date.parse(a.lastCheckedAt || a.metricsAsOf) || 0) - (Date.parse(b.lastCheckedAt || b.metricsAsOf) || 0)).map(p => p.id);
@@ -353,95 +400,166 @@ export async function advanceSync(workbench, { client, now, maxRequests = 1 } = 
 const HOUR = 3600000;
 const CATCHUP_SPACING = 5100;
 const HOURLY_MIN_WINDOW = 300000;
-function hourlyWindow(start, endExclusive, kind = 'latest', method = 'mentions') {
-  return { id: 'hourly:' + method + ':' + new Date(start).toISOString() + ':' + new Date(endExclusive).toISOString(), method,
-    start: new Date(start).toISOString(), endExclusive: new Date(endExclusive).toISOString(), kind,
+function hourlyWindow(start, endExclusive, kind = 'latest', method = 'search', discoveryLane = 'direct') {
+  const from = new Date(start).toISOString(), until = new Date(endExclusive).toISOString();
+  return { id: 'hourly:' + DISCOVERY_QUERY_POLICY + ':' + discoveryLane + ':' + method + ':' + from + ':' + until, method, discoveryLane,
+    queryPolicy: DISCOVERY_QUERY_POLICY, query: discoveryQuery(from, until, DISCOVERY_QUERY_POLICY, discoveryLane),
+    start: from, endExclusive: until, kind,
     cursor: '', previousOldest: null, seenCursors: [], observedPostIds: [] };
 }
-function hourlyCheckpoint(sync) {
+function emptyLane() { return { latestPlannedThrough: null, completedRanges: [], completedThrough: null, coverageFrom: null, lastAuditDay: null }; }
+function laneState(hourly, lane = 'direct') { return hourly.lanes[lane]; }
+function mirrorDirect(hourly) {
+  const direct = laneState(hourly);
+  for (const key of ['latestPlannedThrough', 'completedRanges', 'completedThrough', 'coverageFrom', 'lastAuditDay', 'lastAuditAt', 'lastAuditRange']) hourly[key] = direct[key] ?? null;
+}
+function hourlyCheckpoint(sync, at) {
   const hourly = copy(sync.hourly || {});
-  hourly.version = 1; hourly.target = TARGET; hourly.method = 'mentions';
+  const changed = hourly.queryPolicy !== DISCOVERY_QUERY_POLICY;
+  hourly.version = 3; hourly.target = TARGET; hourly.method = 'search';
   hourly.pendingWindows = Array.isArray(hourly.pendingWindows) ? hourly.pendingWindows : [];
   hourly.completedRanges = Array.isArray(hourly.completedRanges) ? hourly.completedRanges : [];
   hourly.gaps = Array.isArray(hourly.gaps) ? hourly.gaps : [];
+  if (changed) {
+    const previous = hourly.pendingWindows;
+    hourly.policyHistory = [...(hourly.policyHistory || []), { at, queryPolicy: hourly.queryPolicy || 'legacy-unfiltered',
+      completedThrough: hourly.completedThrough || null, completedRangeCount: hourly.completedRanges.length,
+      pendingWindows: previous.map(value => ({ start: value.start, endExclusive: value.endExclusive,
+        discoveryLane: value.discoveryLane || 'direct', method: value.method || 'mentions', hadCursor: !!value.cursor })) }].slice(-3);
+    // Old intervals remain direct searches; broader histories have their own audits.
+    hourly.pendingWindows = previous.map(value => ({ ...hourlyWindow(Date.parse(value.start), Date.parse(value.endExclusive), value.kind || 'policy-recovery'), audit: value.audit === true || value.kind === 'audit' }));
+    hourly.lanes = Object.fromEntries(DISCOVERY_LANES.map(lane => [lane, emptyLane()]));
+    hourly.lanes.direct.latestPlannedThrough = timestamp(hourly.latestPlannedThrough);
+    hourly.catchupLaneIndex = 0;
+  } else {
+    hourly.lanes ||= {};
+    for (const lane of DISCOVERY_LANES) {
+      if (!hourly.lanes[lane]) hourly.lanes[lane] = lane === 'direct' ? { ...emptyLane(), latestPlannedThrough: hourly.latestPlannedThrough,
+        completedRanges: hourly.completedRanges, completedThrough: hourly.completedThrough, coverageFrom: hourly.coverageFrom,
+        lastAuditDay: hourly.lastAuditDay, lastAuditAt: hourly.lastAuditAt, lastAuditRange: hourly.lastAuditRange } : emptyLane();
+    }
+    hourly.pendingWindows = hourly.pendingWindows.map(value => ({ ...value, discoveryLane: value.discoveryLane || 'direct' }));
+  }
+  for (const lane of DISCOVERY_LANES) {
+    const value = laneState(hourly, lane);
+    value.completedRanges = Array.isArray(value.completedRanges) ? value.completedRanges : [];
+    for (const key of ['latestPlannedThrough', 'completedThrough', 'coverageFrom', 'lastAttemptAt', 'lastSuccessAt', 'lastDataAt']) value[key] = timestamp(value[key]);
+    for (const window of hourly.pendingWindows.filter(window => window.discoveryLane === lane)) if (!value.coverageFrom || Date.parse(window.start) < Date.parse(value.coverageFrom)) value.coverageFrom = window.start;
+  }
+  hourly.queryPolicy = DISCOVERY_QUERY_POLICY;
   for (const key of ['requestCount', 'searchPages', 'latestPages', 'catchupPages', 'addedPosts', 'splitWindows']) hourly[key] = Number.isInteger(hourly[key]) && hourly[key] >= 0 ? hourly[key] : 0;
   hourly.catchupRequestCount = Number.isInteger(hourly.catchupRequestCount) && hourly.catchupRequestCount >= 0 ? hourly.catchupRequestCount : hourly.catchupPages;
-  for (const key of ['lastAttemptAt', 'lastSuccessAt', 'lastDataAt', 'latestPlannedThrough', 'completedThrough', 'coverageFrom', 'nextRunAt', 'nextAttemptAt', 'catchupLastAttemptAt', 'catchupLastSuccessAt']) hourly[key] = timestamp(hourly[key]);
+  for (const key of ['lastAttemptAt', 'lastSuccessAt', 'lastDataAt', 'nextRunAt', 'nextAttemptAt', 'catchupLastAttemptAt', 'catchupLastSuccessAt']) hourly[key] = timestamp(hourly[key]);
   hourly.lastError ||= null; hourly.catchupLastError ||= null;
   hourly.catchupNextAttemptAt = hourly.nextAttemptAt;
-  sync.hourly = hourly; return hourly;
+  mirrorDirect(hourly); sync.hourly = hourly; return hourly;
 }
 function appendHourlyWindow(hourly, value) {
-  if (!hourly.pendingWindows.some(window => window.id === value.id || (window.method || 'mentions') === value.method && window.start === value.start && window.endExclusive === value.endExclusive)) hourly.pendingWindows.push(value);
-  if (!hourly.coverageFrom || Date.parse(value.start) < Date.parse(hourly.coverageFrom)) hourly.coverageFrom = value.start;
+  if (!hourly.pendingWindows.some(window => window.id === value.id || window.queryPolicy === value.queryPolicy && window.discoveryLane === value.discoveryLane && window.method === value.method && window.start === value.start && window.endExclusive === value.endExclusive)) hourly.pendingWindows.push(value);
+  const state = laneState(hourly, value.discoveryLane);
+  if (!state.coverageFrom || Date.parse(value.start) < Date.parse(state.coverageFrom)) state.coverageFrom = value.start;
 }
 function migrateHourlyRecent(sync, hourly) {
   if (hourly.migratedLegacyRecent) return;
   const old = sync.discovery.recentWindow;
-  if (old && timestamp(old.start) && timestamp(old.endExclusive) && Date.parse(old.start) < Date.parse(old.endExclusive)) {
-    const value = { ...copy(old), ...hourlyWindow(Date.parse(old.start), Date.parse(old.endExclusive), 'legacy-recent', 'search'), cursor: old.cursor || '', previousOldest: old.previousOldest ?? null, seenCursors: copy(old.seenCursors || []), observedPostIds: copy(old.observedPostIds || []) };
-    value.kind = 'legacy-recent'; value.observedPostIds ||= [];
-    appendHourlyWindow(hourly, value);
-  }
+  if (old && timestamp(old.start) && timestamp(old.endExclusive) && Date.parse(old.start) < Date.parse(old.endExclusive)) appendHourlyWindow(hourly, hourlyWindow(Date.parse(old.start), Date.parse(old.endExclusive), 'legacy-recent'));
   hourly.migratedLegacyRecent = true;
+}
+function prepareHourlyAudit(hourly, nowMs) {
+  const day = new Date(nowMs).toISOString().slice(0, 10);
+  for (const lane of DISCOVERY_LANES) {
+    const state = laneState(hourly, lane);
+    if (state.lastAuditDay === day || hourly.pendingWindows.some(value => value.discoveryLane === lane && (value.kind === 'audit' || value.audit === true))) continue;
+    const until = Math.floor(nowMs / 1000) * 1000 - HOUR, from = until - 71 * HOUR;
+    for (let point = from; point < until;) {
+      const end = Math.min(until, Math.floor(point / DAY) * DAY + DAY);
+      appendHourlyWindow(hourly, { ...hourlyWindow(point, end, 'audit', 'search', lane), audit: true }); point = end;
+    }
+    state.lastAuditDay = day; state.lastAuditAt = new Date(nowMs).toISOString();
+    state.lastAuditRange = { start: new Date(from).toISOString(), endExclusive: new Date(until).toISOString() };
+  }
 }
 function prepareHourlyLatest(sync, hourly, nowMs) {
   const until = Math.floor(nowMs / 1000) * 1000;
-  const previous = Date.parse(hourly.latestPlannedThrough) || Date.parse(sync.discovery.recentThrough) || Date.parse(sync.discovery.recentWindow?.endExclusive);
-  if (Number.isFinite(previous) && previous >= until) return null;
-  // The latest request always reaches now, even after an outage. Missing older
-  // time remains a separate cursor queue rather than delaying the current hour.
-  const from = Math.floor(Math.max(until - HOUR - INTERVAL, Number.isFinite(previous) ? previous - INTERVAL : until - HOUR - INTERVAL) / 1000) * 1000;
-  if (Number.isFinite(previous) && previous < from) {
-    for (let point = previous; point < from;) {
-      const end = Math.min(from, Math.floor(point / DAY) * DAY + DAY);
-      appendHourlyWindow(hourly, hourlyWindow(point, end, 'outage')); point = end;
+  let direct = null;
+  for (const lane of DISCOVERY_LANES) {
+    const state = laneState(hourly, lane);
+    const previous = Date.parse(state.latestPlannedThrough) || (lane === 'direct' ? Date.parse(sync.discovery.recentThrough) || Date.parse(sync.discovery.recentWindow?.endExclusive) : NaN);
+    if (Number.isFinite(previous) && previous >= until) continue;
+    const from = Math.floor(Math.max(until - HOUR - INTERVAL, Number.isFinite(previous) ? previous - INTERVAL : until - HOUR - INTERVAL) / 1000) * 1000;
+    if (Number.isFinite(previous) && previous < from) {
+      for (let point = previous; point < from;) {
+        const end = Math.min(from, Math.floor(point / DAY) * DAY + DAY);
+        appendHourlyWindow(hourly, hourlyWindow(point, end, 'outage', 'search', lane)); point = end;
+      }
     }
+    const value = hourlyWindow(from, until, 'latest', 'search', lane); appendHourlyWindow(hourly, value);
+    state.latestPlannedThrough = value.endExclusive; state.latestRange = { start: value.start, endExclusive: value.endExclusive };
+    if (lane === 'direct') direct = hourly.pendingWindows.find(window => window.id === value.id);
   }
-  const value = hourlyWindow(from, until, 'latest'); appendHourlyWindow(hourly, value);
-  hourly.latestPlannedThrough = value.endExclusive;
-  return hourly.pendingWindows.find(window => window.id === value.id);
+  return direct;
 }
 function chooseHourlyCatchup(hourly) {
-  const oldest = [...hourly.pendingWindows].sort((a, b) => Date.parse(a.start) - Date.parse(b.start))[0];
-  // Five attempts keep the current hour moving; the sixth always gives older
-  // saved work a turn. Count attempts, not successes, so a failing current page
-  // cannot starve legacy or outage recovery indefinitely.
-  if ((hourly.catchupRequestCount + 1) % 6 === 0) return oldest;
-  const latest = hourly.latestWindow;
-  if (!latest || !timestamp(latest.start) || !timestamp(latest.endExclusive)) return oldest;
-  const from = Date.parse(latest.start), until = Date.parse(latest.endExclusive);
-  return [...hourly.pendingWindows].filter(window => (window.method || 'mentions') === 'mentions' &&
-    Date.parse(window.start) < until && Date.parse(window.endExclusive) > from)
-    .sort((a, b) => Date.parse(b.start) - Date.parse(a.start) || Date.parse(b.endExclusive) - Date.parse(a.endExclusive))[0] || oldest;
+  const oldest = values => [...values].sort((a, b) => Date.parse(a.start) - Date.parse(b.start) || a.id.localeCompare(b.id))[0];
+  // The old-work slot also rotates lanes. A dense contextual audit must not
+  // monopolize tied oldest timestamps while direct/evidence audits wait.
+  if ((hourly.catchupRequestCount + 1) % 6 === 0) {
+    const start = Number.isInteger(hourly.oldLaneIndex) ? hourly.oldLaneIndex % DISCOVERY_LANES.length : 0;
+    for (let offset = 0; offset < DISCOVERY_LANES.length; offset++) {
+      const at = (start + offset) % DISCOVERY_LANES.length;
+      const value = oldest(hourly.pendingWindows.filter(window => window.discoveryLane === DISCOVERY_LANES[at]));
+      if (value) { hourly.oldLaneIndex = (at + 1) % DISCOVERY_LANES.length; return value; }
+    }
+    return null;
+  }
+  const start = Number.isInteger(hourly.catchupLaneIndex) ? hourly.catchupLaneIndex % DISCOVERY_LANES.length : 0;
+  for (let offset = 0; offset < DISCOVERY_LANES.length; offset++) {
+    const at = (start + offset) % DISCOVERY_LANES.length, lane = DISCOVERY_LANES[at];
+    const values = hourly.pendingWindows.filter(window => window.discoveryLane === lane);
+    if (!values.length) continue;
+    hourly.catchupLaneIndex = (at + 1) % DISCOVERY_LANES.length;
+    const latest = laneState(hourly, lane).latestRange;
+    return latest ? [...values].filter(window => Date.parse(window.start) < Date.parse(latest.endExclusive) && Date.parse(window.endExclusive) > Date.parse(latest.start))
+      .sort((a, b) => Date.parse(b.start) - Date.parse(a.start) || Date.parse(b.endExclusive) - Date.parse(a.endExclusive))[0] || oldest(values) : oldest(values);
+  }
+  return null;
 }
-function hourlyGap(sync, hourly, value) {
-  hourly.gaps.push(value); addGap(sync, { ...value, source: 'hourly-discovery' });
-}
+function hourlyGap(sync, hourly, value) { hourly.gaps.push(value); addGap(sync, { ...value, source: 'hourly-discovery' }); }
 function replaceHourlyWithSplit(sync, hourly, index, window, code, at, details = {}) {
-  const from = Date.parse(window.start), until = Date.parse(window.endExclusive);
+  const from = Date.parse(window.start), until = Date.parse(window.endExclusive), lane = window.discoveryLane || 'direct';
   if (until - from >= 2 * HOURLY_MIN_WINDOW) {
     const middle = Math.floor((from + until) / 2000) * 1000;
-    hourly.pendingWindows.splice(index, 1, hourlyWindow(from, middle, 'recovery', window.method || 'mentions'), hourlyWindow(middle, until, 'recovery', window.method || 'mentions'));
+    hourly.pendingWindows.splice(index, 1, { ...hourlyWindow(from, middle, 'recovery', window.method || 'search', lane), audit: !!window.audit }, { ...hourlyWindow(middle, until, 'recovery', window.method || 'search', lane), audit: !!window.audit });
     hourly.splitWindows++; return 'split';
   }
-  hourlyGap(sync, hourly, { code, at, start: window.start, endExclusive: window.endExclusive, ...details });
+  hourlyGap(sync, hourly, { code, at, discoveryLane: lane, start: window.start, endExclusive: window.endExclusive, ...details });
   hourly.pendingWindows.splice(index, 1); return 'gap';
 }
-function hourlyKnownMissing(dataset, window) {
+function hourlyKnownMissing(dataset, window, state) {
   const seen = new Set(window.observedPostIds || []), from = Date.parse(window.start), until = Date.parse(window.endExclusive);
-  return dataset.posts.filter(post => !seen.has(post.id) && Date.parse(post.publishedAt) >= from && Date.parse(post.publishedAt) < until &&
-    typeof post.authorHandle === 'string' && post.authorHandle.toLowerCase() !== TARGET.toLowerCase() && directlyMentioned({ text: post.body })).length;
+  return dataset.posts.filter(post => (Model.countablePost ? Model.countablePost(post, state).eligible : Model.postEligibility(post).eligible && post.relevance?.status !== 'review') && !seen.has(post.id) && Date.parse(post.publishedAt) >= from && Date.parse(post.publishedAt) < until &&
+    typeof post.authorHandle === 'string' && post.authorHandle.toLowerCase() !== TARGET.toLowerCase() && matchesDiscoveryLane(post, window.discoveryLane || 'direct')).length;
 }
-function promoteHourlyCoverage(hourly) {
-  let point = Date.parse(hourly.completedThrough || hourly.coverageFrom);
+function compactRanges(ranges) {
+  const result = [];
+  for (const range of [...ranges].sort((a, b) => Date.parse(a.start) - Date.parse(b.start))) {
+    const last = result.at(-1);
+    if (last && Date.parse(range.start) <= Date.parse(last.endExclusive)) last.endExclusive = new Date(Math.max(Date.parse(last.endExclusive), Date.parse(range.endExclusive))).toISOString();
+    else result.push({ start: range.start, endExclusive: range.endExclusive });
+  }
+  return result;
+}
+function promoteHourlyCoverage(hourly, lane = 'direct') {
+  const state = laneState(hourly, lane);
+  state.completedRanges = compactRanges(state.completedRanges);
+  let point = Date.parse(state.completedThrough || state.coverageFrom);
   if (!Number.isFinite(point)) return;
   const initial = point;
   for (;;) {
-    const next = hourly.completedRanges.reduce((end, range) => Date.parse(range.start) <= point && Date.parse(range.endExclusive) > end ? Date.parse(range.endExclusive) : end, point);
+    const next = state.completedRanges.reduce((end, range) => Date.parse(range.start) <= point && Date.parse(range.endExclusive) > end ? Date.parse(range.endExclusive) : end, point);
     if (next === point) break; point = next;
   }
-  if (point > initial || hourly.completedThrough) hourly.completedThrough = new Date(point).toISOString();
+  if (point > initial || state.completedThrough) state.completedThrough = new Date(point).toISOString();
 }
 
 /**
@@ -453,31 +571,34 @@ export async function advanceHourlyDiscovery(workbench, { client, now, maxReques
   let dataset = Model.validateDataset(copy(workbench.dataset));
   let state = Model.validateState(copy(workbench.state || Model.initialState()));
   const nowMs = instant(now), at = new Date(nowMs).toISOString();
-  const sync = initialSync(workbench.sync, nowMs), result = () => ({ dataset, state, sync });
+  const sync = initialSync(workbench.sync, nowMs), result = () => { if (sync.hourly?.lanes) mirrorDirect(sync.hourly); return { dataset, state, sync }; };
   if (!['latest', 'catchup'].includes(lane) || !Number.isInteger(maxRequests) || maxRequests < 0) throw new Error('Invalid hourly discovery action.');
   if (!sync.enabled) { sync.status = 'disabled'; return result(); }
   if (sync.paused || maxRequests === 0) return result();
-  const hourly = hourlyCheckpoint(sync);
+  const hourly = hourlyCheckpoint(sync, at);
   const due = lane === 'latest' ? hourly.nextRunAt || sync.nextRunAt : hourly.nextAttemptAt;
   if (due && Date.parse(due) > nowMs) return result();
   migrateHourlyRecent(sync, hourly);
   const chosen = lane === 'latest' ? prepareHourlyLatest(sync, hourly, nowMs)
     : chooseHourlyCatchup(hourly);
+  if (lane === 'latest') prepareHourlyAudit(hourly, nowMs);
   if (!chosen) return result();
   const index = hourly.pendingWindows.indexOf(chosen), window = copy(chosen);
   if (index < 0 || !timestamp(window.start) || !timestamp(window.endExclusive) || Date.parse(window.start) >= Date.parse(window.endExclusive) || typeof window.cursor !== 'string' || !Array.isArray(window.seenCursors)) throw new Error('Invalid checkpoint.');
-  const method = window.method || 'mentions';
+  const method = window.method || 'search';
   if (!['search', 'mentions'].includes(method) || !client || typeof client[method === 'mentions' ? 'mentionsPage' : 'searchPage'] !== 'function') throw new Error('A read-only collection client is required.');
   const latestDueBefore = hourly.nextRunAt || sync.nextRunAt;
+  const queryLane = window.discoveryLane || 'direct', queryState = laneState(hourly, queryLane);
   sync.phase = 'discovery'; sync.activeLane = lane === 'latest' ? 'hourly-latest' : 'hourly-catchup';
   sync.lastAttemptAt = at; sync.requestCount++; hourly.requestCount++;
+  queryState.lastAttemptAt = at;
   if (lane === 'latest') hourly.lastAttemptAt = at;
   else { hourly.catchupLastAttemptAt = at; hourly.catchupRequestCount++; }
-  const snapshot = { start: window.start, endExclusive: window.endExclusive, method, lane, status: 'pending' };
+  const snapshot = { start: window.start, endExclusive: window.endExclusive, method, lane, discoveryLane: queryLane, status: 'pending' };
   hourly.lastWindow = snapshot;
   if (lane === 'latest') hourly.latestWindow = { ...snapshot };
   try {
-    const query = '@' + TARGET + ' since_time:' + Math.floor(Date.parse(window.start) / 1000) + ' until_time:' + Math.floor(Date.parse(window.endExclusive) / 1000);
+    const query = window.query || discoveryQuery(window.start, window.endExclusive, window.queryPolicy || 'legacy-unfiltered', queryLane);
     const page = method === 'mentions'
       ? await client.mentionsPage({ userName: TARGET, sinceTime: Math.floor(Date.parse(window.start) / 1000), untilTime: Math.floor(Date.parse(window.endExclusive) / 1000), cursor: window.cursor })
       : await client.searchPage({ query, cursor: window.cursor });
@@ -494,6 +615,7 @@ export async function advanceHourlyDiscovery(workbench, { client, now, maxReques
     hourly.searchPages++; hourly[lane === 'latest' ? 'latestPages' : 'catchupPages']++;
     hourly.addedPosts += added; hourly.lastPageAdded = added;
     window.observedPostIds = [...new Set([...(window.observedPostIds || []), ...incoming.posts.map(post => post.id)])];
+    delete window.consecutiveTimeouts;
     snapshot.returnedPosts = incoming.posts.length; snapshot.addedPosts = added;
     if (cycle || jumped || empty) snapshot.status = replaceHourlyWithSplit(sync, hourly, index, window, cycle ? 'CURSOR_CYCLE' : jumped ? 'PAGINATION_ORDER' : 'EMPTY_CONTINUATION', at);
     else if (page.hasNextPage) {
@@ -501,15 +623,17 @@ export async function advanceHourlyDiscovery(workbench, { client, now, maxReques
       window.seenCursors = [...window.seenCursors, page.nextCursor].slice(-1000);
       hourly.pendingWindows[index] = window;
     } else {
-      const missing = hourlyKnownMissing(dataset, window);
+      const missing = hourlyKnownMissing(dataset, window, state);
       if (missing) {
         snapshot.status = replaceHourlyWithSplit(sync, hourly, index, window, 'KNOWN_POST_NOT_RETURNED', at, { count: missing });
       } else {
-        hourly.pendingWindows.splice(index, 1); hourly.completedRanges.push({ start: window.start, endExclusive: window.endExclusive });
-        snapshot.status = 'complete'; promoteHourlyCoverage(hourly);
+        hourly.pendingWindows.splice(index, 1); queryState.completedRanges.push({ start: window.start, endExclusive: window.endExclusive });
+        snapshot.status = 'complete'; promoteHourlyCoverage(hourly, queryLane);
       }
     }
     sync.lastSuccessAt = at; sync.lastError = null; sync.consecutiveFailures = 0; sync.status = 'running';
+    queryState.lastSuccessAt = at; queryState.lastError = null; queryState.lastWindow = { ...snapshot };
+    if (incoming.posts.length) queryState.lastDataAt = at;
     if (incoming.posts.length) { sync.lastDataAt = at; if (lane === 'latest') hourly.lastDataAt = at; }
     if (lane === 'latest') { hourly.lastSuccessAt = at; hourly.lastError = null; hourly.latestWindow = { ...snapshot }; }
     else { hourly.catchupLastSuccessAt = at; hourly.catchupLastError = null; }
@@ -530,6 +654,7 @@ export async function advanceHourlyDiscovery(workbench, { client, now, maxReques
       return result();
     }
     recordError(sync, error, nowMs); snapshot.status = 'error';
+    queryState.lastError = copy(sync.lastError); queryState.lastWindow = { ...snapshot };
     hourly.nextAttemptAt = sync.nextRunAt;
     if (lane === 'latest') {
       hourly.lastError = copy(sync.lastError); hourly.latestWindow = { ...snapshot };
@@ -537,6 +662,20 @@ export async function advanceHourlyDiscovery(workbench, { client, now, maxReques
     } else {
       hourly.catchupLastError = copy(sync.lastError);
       if (!sync.paused) sync.nextRunAt = latestDueBefore;
+    }
+    if (sync.lastError?.diagnosticCode === 'REQUEST_TIMEOUT' && !sync.paused) {
+      window.consecutiveTimeouts = (window.consecutiveTimeouts || 0) + 1;
+      hourly.pendingWindows[index] = window;
+      if (window.consecutiveTimeouts >= 2) {
+        snapshot.status = replaceHourlyWithSplit(sync, hourly, index, window, 'REQUEST_TIMEOUT', at);
+        hourly.lastAnomaly = { code: 'REQUEST_TIMEOUT', at };
+        sync.consecutiveFailures = 0; sync.lastError = null; sync.status = 'running';
+        hourly.nextAttemptAt = new Date(nowMs + CATCHUP_SPACING).toISOString();
+        if (lane === 'latest') hourly.latestWindow = { ...snapshot };
+        else hourly.catchupLastError = null;
+      }
+    } else if (window.consecutiveTimeouts) {
+      delete window.consecutiveTimeouts; hourly.pendingWindows[index] = window;
     }
   }
   hourly.catchupNextAttemptAt = hourly.nextAttemptAt;
