@@ -13,14 +13,14 @@ if (available) {
   for (const name of ['index.html','styles.css','scoring.js','model.js','app.js','seed.js','seed.json']) {
     await copyFile(path.join(app, name), path.join(root, 'public', name));
   }
-  for (const name of ['model.js','scoring.js','twitterapi.mjs','live-engine.mjs','backfill.mjs','seed.json']) {
+  for (const name of ['model.js','scoring.js','twitterapi.mjs','live-engine.mjs','backfill.mjs','relevance.mjs','seed.json']) {
     let content = await readFile(path.join(app, name), 'utf8');
     content = content.replaceAll("'./model.js'", "'./model.cjs'").replaceAll("'./scoring.js'", "'./scoring.cjs'");
     const filename = name.endsWith('.js') ? name.slice(0, -3) + '.cjs' : name;
     await writeFile(path.join(source, filename), content);
   }
 }
-const entry = `import Model from './model.cjs';\nimport {createClient} from './twitterapi.mjs';\nimport {advanceSync,advanceHourlyDiscovery,mergeDataset} from './live-engine.mjs';\nimport {beginBackfill,advanceBackfill} from './backfill.mjs';\nimport seed from './seed.json';\nexport {Model,createClient,advanceSync,advanceHourlyDiscovery,mergeDataset,beginBackfill,advanceBackfill,seed};\n`;
+const entry = `import Model from './model.cjs';\nimport {createClient} from './twitterapi.mjs';\nimport {advanceSync,advanceHourlyDiscovery,mergeDataset,normalizeDiscoveryPage} from './live-engine.mjs';\nimport {beginBackfill,advanceBackfill} from './backfill.mjs';\nimport seed from './seed.json';\nexport {Model,createClient,advanceSync,advanceHourlyDiscovery,mergeDataset,normalizeDiscoveryPage,beginBackfill,advanceBackfill,seed};\n`;
 await writeFile(path.join(source, 'entry.mjs'), entry);
 await build({ entryPoints: [path.join(source, 'entry.mjs')], outfile: path.join(root, 'lib/entropy-engine.mjs'),
   bundle: true, platform: 'browser', format: 'esm', target: 'es2022', logLevel: 'warning' });
