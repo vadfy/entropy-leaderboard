@@ -1,5 +1,5 @@
 import { env } from 'cloudflare:workers';
-import { Model, createClient, advanceSync, advanceHourlyDiscovery, beginBackfill, advanceBackfill, seed } from './entropy-engine.mjs';
+import { Model, createClient, advanceSync, advanceHourlyDiscovery, beginBackfill, advanceBackfill, normalizeDiscoveryPage, mergeDataset, seed } from './entropy-engine.mjs';
 import { projectCommunitySnapshot, publishCommunitySnapshot } from './community-projection';
 
 type ObjectValue = Record<string, any>;
@@ -12,7 +12,7 @@ const LEASE_MS = 120000;
 const BACKFILL_SPACING_MS = 5100;
 const CHUNK_UNITS = 128000;
 const MAX_SNAPSHOT_BYTES = 24 * 1024 * 1024;
-const STATE_MAPS = ['bans', 'periodDecisions', 'postExclusions', 'accountReviews', 'identityEvidence'];
+const STATE_MAPS = ['bans', 'periodDecisions', 'postExclusions', 'postRelevance', 'accountReviews', 'identityEvidence'];
 const ENCODER = new TextEncoder();
 
 export class WorkbenchError extends Error {
@@ -222,6 +222,21 @@ export async function importWorkbench(payload: ObjectValue) {
   assertRevision(workbench, payload.expectedRevision); assertNotBusy(control);
   if (workbench.sync.enabled) throw new WorkbenchError(400, 'COLLECTOR_ACTIVE', 'Stop the collector before importing a replacement dataset.');
   const dataset = validatedDataset(payload.dataset);
+  // Replacing a backup cannot turn a known reply/repost into a counted original
+  // merely by omitting its type fields. Keep positive evidence for the same ID.
+  const knownPosts = new Map(workbench.dataset.posts.map((post: ObjectValue) => [post.id, post]));
+  for (const post of dataset.posts as ObjectValue[]) {
+    const previous = knownPosts.get(post.id) as ObjectValue | undefined;
+    if (!previous) continue;
+    // A replacement cannot bypass review by dropping its stored relevance facts.
+    if (previous.relevance) post.relevance = structuredClone(previous.relevance);
+    if (previous.discoveryLanes) post.discoveryLanes = structuredClone(previous.discoveryLanes);
+    const kind = Model.postEligibility(previous);
+    if (kind.reason === 'reply') {
+      post.isReply = true;
+      if (previous.inReplyToId !== null && previous.inReplyToId !== undefined) post.inReplyToId = previous.inReplyToId;
+    } else if (kind.reason === 'repost') post.isRepost = true;
+  }
   let candidate = payload.isBackup === true ? validatedState(payload.state) : workbench.state;
   candidate = { ...candidate, identityEvidence: { ...candidate.identityEvidence, ...workbench.state.identityEvidence } };
   let state: ObjectValue;
@@ -327,7 +342,7 @@ export async function runMetricsRefresh() {
   const notBefore = Math.max(Date.parse(previous.nextRunAt) || 0, Date.parse(control.updated_at) + BACKFILL_SPACING_MS);
   if (notBefore > now) return external(workbench, control);
   const numeric = (value: unknown) => typeof value === 'string' && /^[1-9]\d*$/.test(value);
-  const eligible = workbench.dataset.posts.filter((post: ObjectValue) => numeric(post.id));
+  const eligible = workbench.dataset.posts.filter((post: ObjectValue) => numeric(post.id) && Model.countablePost(post, workbench.state).eligible);
   const eligibleIds = new Set(eligible.map((post: ObjectValue) => post.id));
   let pending = [...new Set((workbench.sync.refresh?.pendingIds || []).filter((id: unknown) => eligibleIds.has(id)))];
   if (!pending.length) pending = [...eligible].sort((a: ObjectValue, b: ObjectValue) => (Date.parse(a.lastCheckedAt || a.metricsAsOf) || 0) - (Date.parse(b.lastCheckedAt || b.metricsAsOf) || 0)).map((post: ObjectValue) => post.id);
@@ -374,6 +389,92 @@ export async function runMetricsRefresh() {
   }
 }
 
+/** Explicit, bounded exact-ID recovery; only eligible @entropyIO posts are added. */
+export async function runPostRepair(rawIds: unknown, expectedRevision?: unknown) {
+  if (!Array.isArray(rawIds) || !rawIds.length || rawIds.length > 20
+      || rawIds.some(id => typeof id !== 'string' || !/^[1-9]\d{0,24}$/.test(id))
+      || new Set(rawIds).size !== rawIds.length) return invalid('Provide 1–20 unique X post IDs.');
+  const ids = rawIds as string[];
+  const { database, workbench, control } = await loadInternal();
+  if (expectedRevision !== undefined) assertRevision(workbench, expectedRevision);
+  requireCollection(workbench); assertNotBusy(control);
+  const now = Date.now(), at = new Date(now).toISOString(), today = at.slice(0, 10);
+  const notBefore = Math.max(Date.parse(workbench.sync.postRepair?.nextAttemptAt) || 0, Date.parse(control.updated_at) + BACKFILL_SPACING_MS);
+  if (notBefore > now) throw new WorkbenchError(429, 'REPAIR_NOT_DUE', 'Wait briefly before another recovery request.');
+  if (control.daily_date === today && control.daily_attempts >= CATCHUP_DAILY_LIMIT)
+    throw new WorkbenchError(429, 'FRESH_DISCOVERY_RESERVE', 'Post recovery is waiting to preserve the allowance for new-post discovery.');
+  const token = crypto.randomUUID();
+  const claim = await database.prepare('UPDATE entropy_control SET lease_token=?,lease_until=?,daily_attempts=CASE WHEN daily_date=? THEN daily_attempts+1 ELSE 1 END,daily_date=?,updated_at=? WHERE id=? AND revision=? AND (lease_token IS NULL OR lease_until<=?) AND updated_at<=? AND (daily_date<>? OR daily_attempts<?)')
+    .bind(token, now + LEASE_MS, today, today, at, 'main', workbench.revision, now,
+      new Date(now - BACKFILL_SPACING_MS).toISOString(), today, CATCHUP_DAILY_LIMIT).run();
+  if (claim.meta.changes !== 1) {
+    const latest = await loadInternal();
+    if (latest.control.daily_date === today && latest.control.daily_attempts >= CATCHUP_DAILY_LIMIT)
+      throw new WorkbenchError(429, 'FRESH_DISCOVERY_RESERVE', 'Post recovery is waiting to preserve the allowance for new-post discovery.');
+    if (latest.control.lease_token && latest.control.lease_until > now)
+      throw new WorkbenchError(423, 'SYNC_BUSY', 'An update is in progress. Try again shortly.');
+    throw new WorkbenchError(409, 'CONFLICT', 'Another update started. Retry later.');
+  }
+  const requestCount = (Number.isSafeInteger(workbench.sync.requestCount) ? workbench.sync.requestCount : 0) + 1;
+  try {
+    const page = await createClient({ apiKey: providerKey()!, timeoutMs: 65000 }).tweetsByIds(ids);
+    const incoming = normalizeDiscoveryPage(page.tweets, at);
+    const oldIds = new Set(workbench.dataset.posts.map((post: ObjectValue) => post.id));
+    // An exact lookup can prove an older, untyped record was a reply. Retain
+    // that positive evidence even though the record is ineligible for discovery.
+    // Newly found replies/reposts are never inserted into the source history.
+    const returned = new Map(page.tweets.map((post: ObjectValue) => [post.id, post]));
+    const authors = new Map(workbench.dataset.authors.map((author: ObjectValue) => [author.id, author]));
+    const classified = { ...workbench.dataset, posts: workbench.dataset.posts.map((post: ObjectValue) => {
+      const observation = returned.get(post.id) as ObjectValue | undefined;
+      if (!observation) return post;
+      const kind = Model.postEligibility(observation);
+      if (kind.eligible) return post;
+      const author = authors.get(post.authorId) as ObjectValue | undefined;
+      const sameOwner = post.authorId === observation.author?.id || post.authorId.startsWith('sample:')
+        && typeof author?.handle === 'string' && typeof observation.author?.userName === 'string'
+        && author.handle.replace(/^@/, '').toLowerCase() === observation.author.userName.toLowerCase();
+      if (!sameOwner) throw new Error('Post ownership conflict.');
+      return kind.reason === 'reply' ? { ...post, isReply: true,
+        ...(typeof observation.inReplyToId === 'string' && observation.inReplyToId.trim() ? { inReplyToId: observation.inReplyToId } : {}) }
+        : { ...post, isRepost: true };
+    }) };
+    const dataset = mergeDataset(classified, incoming);
+    const state = Model.reconcileImport(workbench.dataset, dataset, workbench.state);
+    const ignoredReplies = page.tweets.filter((post: ObjectValue) => Model.postEligibility(post).reason === 'reply').length;
+    const ignoredReposts = page.tweets.filter((post: ObjectValue) => Model.postEligibility(post).reason === 'repost').length;
+    const matched = incoming.posts.length;
+    const queuedForReview = incoming.posts.filter((post: ObjectValue) => post.relevance?.status === 'review').length;
+    const repair = { status: 'complete', requested: ids.length, returned: page.tweets.length,
+      matched, accepted: matched - queuedForReview, queuedForReview,
+      addedPosts: incoming.posts.filter((post: ObjectValue) => !oldIds.has(post.id)).length,
+      ignoredReplies, ignoredReposts, notRelevant: Math.max(0, page.tweets.length - matched - ignoredReplies - ignoredReposts),
+      unavailable: ids.length - page.tweets.length, lastAttemptAt: at, lastSuccessAt: at, nextAttemptAt: null, lastError: null };
+    return await commit(database, workbench, { ...workbench, dataset, state,
+      sync: { ...workbench.sync, requestCount, postRepair: repair } }, token);
+  } catch (error) {
+    if (error instanceof WorkbenchError) {
+      await database.prepare('UPDATE entropy_control SET lease_token=NULL,lease_until=0 WHERE id=? AND lease_token=?').bind('main', token).run().catch(() => {});
+      throw error;
+    }
+    const failure = error as { status?: unknown; code?: unknown };
+    const status = Number.isInteger(failure?.status) ? Number(failure.status) : null;
+    const code = status === 402 ? 'CREDITS_EXHAUSTED' : status === 401 || status === 403 ? 'AUTH_REQUIRED'
+      : status === 429 ? 'RATE_LIMITED' : 'REPAIR_FAILED';
+    const paused = code === 'CREDITS_EXHAUSTED' || code === 'AUTH_REQUIRED';
+    const nextAttemptAt = new Date(now + (code === 'RATE_LIMITED' ? 3600000 : 60000)).toISOString();
+    const diagnosticCode = ['NETWORK_ERROR', 'REQUEST_TIMEOUT', 'INVALID_RESPONSE', 'PROVIDER_ERROR', 'HTTP_ERROR', 'RATE_LIMITED', 'CREDITS_EXHAUSTED'].includes(String(failure?.code)) ? failure.code : 'INVALID_POST_RESPONSE';
+    const lastError = { code, diagnosticCode, at, httpStatus: status };
+    try {
+      return await commit(database, workbench, { ...workbench, sync: { ...workbench.sync, requestCount,
+        ...(paused ? { paused: true, status: 'error', lastError } : {}),
+        postRepair: { status: 'error', requested: ids.length, lastAttemptAt: at, lastSuccessAt: null, nextAttemptAt, lastError } } }, token);
+    } finally {
+      await database.prepare('UPDATE entropy_control SET lease_token=NULL,lease_until=0 WHERE id=? AND lease_token=?').bind('main', token).run().catch(() => {});
+    }
+  }
+}
+
 function requireCollection(workbench: Workbench) {
   if (!providerKey()) throw new WorkbenchError(400, 'KEY_REQUIRED', 'Configure the server’s TWITTERAPI_IO_KEY secret first.');
   if (!workbench.sync.enabled) throw new WorkbenchError(400, 'COLLECTOR_DISABLED', 'Enable the collector before starting the historical collection.');
@@ -388,9 +489,10 @@ function backfillResponse(workbench: Workbench, control: StoredRow, nextStepAt?:
 }
 function backfillArchive(job: ObjectValue) {
   const safe: ObjectValue = {};
-  for (const key of ['version', 'id', 'target', 'method', 'start', 'endExclusive', 'status', 'requestCount', 'requestLimit', 'successfulPages', 'addedPosts', 'initialWindows', 'completedWindows', 'splitWindows', 'startedAt', 'finishedAt', 'cancelledAt']) {
+  for (const key of ['version', 'id', 'target', 'method', 'queryPolicy', 'start', 'endExclusive', 'status', 'requestCount', 'requestLimit', 'successfulPages', 'addedPosts', 'initialWindows', 'completedWindows', 'splitWindows', 'startedAt', 'finishedAt', 'cancelledAt']) {
     if (typeof job[key] === 'string' || typeof job[key] === 'number' || job[key] === null) safe[key] = job[key];
   }
+  if (Array.isArray(job.lanes)) safe.lanes = job.lanes.filter((lane: unknown) => ['direct', 'evidence', 'context'].includes(String(lane)));
   safe.gaps = (Array.isArray(job.gaps) ? job.gaps : []).map((gap: ObjectValue) => {
     const value: ObjectValue = {};
     for (const key of ['code', 'at', 'start', 'endExclusive']) if (typeof gap?.[key] === 'string') value[key] = gap[key];
@@ -406,10 +508,13 @@ export async function startBackfill(payload: ObjectValue) {
   const endExclusive = typeof payload.endExclusive === 'string' ? payload.endExclusive : null;
   const requestLimit = payload.requestLimit ?? 250;
   const method = payload.method ?? 'search';
+  const lanes = payload.lanes;
+  if (lanes !== undefined && (!Array.isArray(lanes) || lanes.length < 1 || lanes.length > 3 || new Set(lanes).size !== lanes.length
+      || lanes.some((lane: unknown) => !['direct', 'evidence', 'context'].includes(String(lane))))) return invalid('Provide unique supported discovery lanes.');
   const now = Date.now();
   if (!['search', 'mentions', 'id-search'].includes(method) || !start || !endExclusive || !Number.isFinite(Date.parse(start)) || !Number.isFinite(Date.parse(endExclusive)) || Date.parse(start) >= Date.parse(endExclusive) || Date.parse(endExclusive) > now || Date.parse(endExclusive) - Date.parse(start) > 62 * 86400000 || !Number.isSafeInteger(requestLimit) || requestLimit < 1 || requestLimit > 1000) return invalid('Provide a supported collection method, an explicit UTC interval up to now, and a bounded request limit.');
   let result;
-  try { result = beginBackfill(workbench, { start, endExclusive, requestLimit, method, now: new Date(now).toISOString() }); }
+  try { result = beginBackfill(workbench, { start, endExclusive, requestLimit, method, ...(lanes === undefined ? {} : { lanes }), now: new Date(now).toISOString() }); }
   catch { return invalid('The historical collection could not be started with this interval.'); }
   if (workbench.sync.backfill && result.sync.backfill?.id !== workbench.sync.backfill.id) result.sync.backfillHistory = [
     ...(Array.isArray(workbench.sync.backfillHistory) ? workbench.sync.backfillHistory : []).map(backfillArchive),
@@ -444,12 +549,14 @@ export async function runBackfill() {
   // It also conservatively spaces a step after a manual state change.
   const notBefore = Math.max(Date.parse(job.nextAttemptAt) || 0, Date.parse(control.updated_at) + BACKFILL_SPACING_MS);
   if (notBefore > now) return backfillResponse(workbench, control, new Date(notBefore).toISOString());
-  if (control.daily_date === today && control.daily_attempts >= DAILY_LIMIT) throw new WorkbenchError(429, 'DAILY_LIMIT', 'The daily collection allowance has been reached. It resets at 00:00 UTC.');
+  if (control.daily_date === today && control.daily_attempts >= CATCHUP_DAILY_LIMIT)
+    throw new WorkbenchError(429, 'FRESH_DISCOVERY_RESERVE', 'Historical collection is waiting to preserve the allowance for new-post discovery.');
   const token = crypto.randomUUID();
-  const claim = await database.prepare('UPDATE entropy_control SET lease_token=?,lease_until=?,daily_attempts=CASE WHEN daily_date=? THEN daily_attempts+1 ELSE 1 END,daily_date=?,updated_at=? WHERE id=? AND revision=? AND (lease_token IS NULL OR lease_until<=?) AND updated_at<=? AND (daily_date<>? OR daily_attempts<?)').bind(token, now + LEASE_MS, today, today, at, 'main', workbench.revision, now, new Date(now - BACKFILL_SPACING_MS).toISOString(), today, DAILY_LIMIT).run();
+  const claim = await database.prepare('UPDATE entropy_control SET lease_token=?,lease_until=?,daily_attempts=CASE WHEN daily_date=? THEN daily_attempts+1 ELSE 1 END,daily_date=?,updated_at=? WHERE id=? AND revision=? AND (lease_token IS NULL OR lease_until<=?) AND updated_at<=? AND (daily_date<>? OR daily_attempts<?)').bind(token, now + LEASE_MS, today, today, at, 'main', workbench.revision, now, new Date(now - BACKFILL_SPACING_MS).toISOString(), today, CATCHUP_DAILY_LIMIT).run();
   if (claim.meta.changes !== 1) {
     const latest = await loadInternal();
-    if (latest.control.daily_date === today && latest.control.daily_attempts >= DAILY_LIMIT) throw new WorkbenchError(429, 'DAILY_LIMIT', 'The daily collection allowance has been reached. It resets at 00:00 UTC.');
+    if (latest.control.daily_date === today && latest.control.daily_attempts >= CATCHUP_DAILY_LIMIT)
+      throw new WorkbenchError(429, 'FRESH_DISCOVERY_RESERVE', 'Historical collection is waiting to preserve the allowance for new-post discovery.');
     if (latest.control.lease_token && latest.control.lease_until > Date.now()) throw new WorkbenchError(423, 'SYNC_BUSY', 'An update is in progress. Try again shortly.');
     return backfillResponse(latest.workbench, latest.control, new Date(Math.max(Date.parse(latest.workbench.sync.backfill?.nextAttemptAt) || 0, Date.parse(latest.control.updated_at) + BACKFILL_SPACING_MS)).toISOString());
   }
