@@ -19,6 +19,7 @@
       </div>
       <nav class="main-nav" aria-label="Розділи кабінету">
       <button type="button" class="nav-button active" data-view="leaderboard" aria-controls="view-leaderboard">Лідерборд</button>
+      <button type="button" class="nav-button" data-view="review" aria-controls="view-review">Перевірка згадок <span id="review-nav-count" class="review-nav-count">0</span></button>
       <button type="button" class="nav-button" data-view="audience" aria-controls="view-audience">Аудиторія</button>
       <button type="button" class="nav-button" data-view="method" aria-controls="view-method">Методика</button>
       <button type="button" class="nav-button" data-view="settings" aria-controls="view-settings">Дані та налаштування</button>
@@ -56,10 +57,17 @@
               </table>
             </div>
             <p class="empty-state" id="leaderboard-empty" hidden>За вибраними умовами авторів немає.</p>
-            <div class="table-notes"><span>«—» означає невідоме значення, а не нуль.</span><span>Engagement % = (лайки + API-репости + цитати) ÷ перегляди × 100. Коментарі показані окремо.</span></div>
+            <div class="table-notes"><span>У рейтингу — оригінальні твіти й цитування; реплаї та звичайні репости не враховуються.</span><span>«—» означає невідоме значення, а не нуль.</span><span>Engagement % = (лайки + API-репости + цитати) ÷ перегляди × 100. Коментарі показані окремо.</span></div>
           </div>
           <aside id="detail-panel" class="detail-panel" aria-label="Картка кріейтора" hidden></aside>
         </div>
+      </section>
+
+      <section id="view-review" class="app-view" aria-labelledby="review-title" hidden>
+        <div class="section-heading"><div><div class="eyebrow">ПЕРЕВІРКА КОНТЕКСТУ</div><h1 id="review-title">Перевірка згадок</h1><p class="section-description">Неоднозначні пости не впливають на рейтинг і не публікуються до підтвердження.</p></div></div>
+        <section class="settings-block repair-post-block" aria-labelledby="repair-title"><h2 id="repair-title">Перевірити твіт за посиланням</h2><p>Якщо пошук пропустив пост, отримайте його безпосередньо з X. Перевірка запуститься лише після натискання кнопки.</p><div class="repair-post-controls"><label class="field"><span class="form-label">Посилання X або ID поста</span><input class="form-input" id="repair-post-input" type="text" autocomplete="off" maxlength="2048" placeholder="https://x.com/author/status/…"></label><button type="button" class="action-button" data-action="repair-post">Перевірити пост</button></div><p class="form-hint" id="repair-post-result" role="status">Це окремий запит до провайдера; він використовує денний ліміт збору. Реплаї не зараховуються.</p></section>
+        <label class="field review-search-field"><span class="form-label">Пошук у черзі</span><input class="form-input" type="search" id="review-search" maxlength="160" autocomplete="off" placeholder="Автор або текст поста"></label>
+        <div id="review-content"></div>
       </section>
 
       <section id="view-audience" class="app-view" aria-labelledby="audience-title" hidden>
