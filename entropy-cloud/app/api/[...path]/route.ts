@@ -1,4 +1,4 @@
-import { getWorkbench, getStatus, getCommunityPreview, saveState, importWorkbench, setCollector, runSync, WorkbenchError } from '../../../lib/workbench';
+import { getWorkbench, getStatus, getCommunityPreview, saveState, importWorkbench, setCollector, runSync, runPostRepair, WorkbenchError } from '../../../lib/workbench';
 
 export const dynamic = 'force-dynamic';
 const LIMIT = 15 * 1024 * 1024;
@@ -52,6 +52,11 @@ export async function POST(request: Request, context: Context) {
     if (path === 'state') return response(await saveState(payload.state, payload.expectedRevision, actorId));
     if (path === 'import') return response(await importWorkbench(payload));
     if (path === 'collector') return response(await setCollector(payload.enabled, payload.expectedRevision));
+    if (path === 'repair') {
+      if (!Number.isSafeInteger(payload.expectedRevision) || payload.expectedRevision < 0 || Object.keys(payload).some(key => !['ids', 'expectedRevision'].includes(key)))
+        throw new WorkbenchError(400, 'INVALID_INPUT', 'A current revision and exact post IDs are required.');
+      return response(await runPostRepair(payload.ids, payload.expectedRevision));
+    }
     if (path === 'sync') {
       if (!Number.isSafeInteger(payload.expectedRevision) || payload.expectedRevision < 0) throw new WorkbenchError(400, 'INVALID_INPUT', 'A current expectedRevision is required.');
       return response(await runSync(payload.expectedRevision, true));
