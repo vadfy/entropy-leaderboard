@@ -743,7 +743,23 @@ var product = /\b(?:markets?|trad(?:e|es|ing)|perps?|perpetuals?|pre[\s-]?ipo|pr
 var genericTrading = /\b(?:crypto|defi|trading|trade|trader|perps?|perpetuals?|tokens?|airdrop|funding|staking|leverage|markets?)\b/i;
 var community = /\b(?:creators?|community|discord|voices|council|genesis|contributors?|ambassadors?)\b/i;
 var scientific = /\b(?:thermodynamics?|thermochemistr(?:y|ical)|shannon|boltzmann|gibbs|physics|electromagnet(?:ic|ism)|information\s+theory|cross[\s-]?entropy|entropy\s+loss|randomness|random\s+(?:numbers?|bits?|seeds?)|rng|heat\s+death|black\s+holes?|dry\s+reforming|synthesis\s+gas|syngas|(?:ni|nickel)\s+catalysts?|applied\s+catalysis|metallurg(?:y|ical)|high[\s-]?entropy\s+alloys?)\b/i;
+var cryptographic = /\b(?:ecdsa|cryptograph(?:ic|ically|y)|prngs?|rngs?|nonces?|signing|signatures?|signers?|random\s+(?:bits?|seeds?))\b/i;
+var technicalEntropy = /\b(?:arbitrary|cryptographic|insufficient|weak|low|fresh|random|shannon)\s+entropy\b|\bentropy\s+(?:sources?|pools?|bits?|in\s+signing|for\s+(?:nonces?|signing)|is\s+randomness)\b/gi;
 var otherDomains = ["entropy.xyz", "entropynetwork.io", "entropy.international"];
+function contextualProduct(prose) {
+  let technical = false;
+  const projectNames = prose.replace(technicalEntropy, (value, offset) => {
+    if (!cryptographic.test(prose.slice(Math.max(0, offset - 100), offset + value.length + 100))) return value;
+    technical = true;
+    return " ".repeat(value.length);
+  });
+  if (!technical) return { product: product.test(prose), technical };
+  const localProject = [...projectNames.matchAll(new RegExp(brand.source, "giu"))].some((match) => {
+    const nearby = prose.slice(Math.max(0, match.index - 240), match.index + match[0].length + 240);
+    return product.test(nearby) && /\b(?:hyperliquid|hip[\s-]?3)\b/i.test(nearby);
+  });
+  return { product: localProject && product.test(prose), technical };
+}
 function url(value) {
   if (typeof value !== "string" || value.length > 4096) return null;
   try {
@@ -810,13 +826,14 @@ function classifyTweet(raw) {
   }
   const quote = plain(tweet.quoted_tweet) ? tweet.quoted_tweet : null;
   if (quote && numericId(quote.id) && plain(quote.author) && exactHandle(quote.author.userName)) signals.add("official_quote");
+  const context = contextualProduct(prose);
   if (brand.test(ownText)) signals.add("brand_name");
   if (/\bhyperliquid\b/i.test(prose)) signals.add("hyperliquid_context");
   if (/\bhip[\s-]?3\b/i.test(prose)) signals.add("hip3_context");
-  if (product.test(prose)) signals.add("product_context");
+  if (context.product) signals.add("product_context");
   if (genericTrading.test(prose)) signals.add("generic_trading_context");
   if (community.test(prose)) signals.add("community_context");
-  if (scientific.test(prose)) signals.add("science_context");
+  if (scientific.test(prose) || context.technical) signals.add("science_context");
   if (/\bpyth\s+entropy\b/i.test(prose) || /(^|[^A-Za-z0-9_])@entropydotxyz(?![A-Za-z0-9_])/i.test(prose) || array(tweet.entities?.user_mentions).some((value) => plain(value) && typeof value.screen_name === "string" && value.screen_name.toLowerCase() === "entropydotxyz")) signals.add("other_project_context");
   return resultFor(signals);
 }
