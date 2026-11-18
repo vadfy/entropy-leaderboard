@@ -251,6 +251,29 @@ function postFixture(){
 }
 
 {
+ const h=harness(), fresh='2026-11-18T13:35:00Z', maintenance='2026-11-18T13:45:00Z';
+ const sync={enabled:true,paused:false,collectionHealth:{freshness:'partial',allLanesCurrent:false},hourly:{lastSuccessAt:fresh,
+  lanes:{direct:{latestSuccessAt:fresh},evidence:{lastSuccessAt:maintenance},context:{lastSuccessAt:maintenance}},pendingWindows:[]}};
+ h.t.applySnapshot({...snapshot(8),connection:{configured:true},sync});h.t.renderBoard();
+ const note=h.element('freshness-note').innerHTML;
+ const format=value=>new Intl.DateTimeFormat('uk-UA',{dateStyle:'short',timeStyle:'short'}).format(new Date(value));
+ assert.ok(note.includes('data-health="pending"'),'a current direct search must not mark all discovery lanes current');
+ assert.ok(note.includes('Без відмітки: <strong>—</strong>'));
+ assert.ok(!note.includes(format(maintenance)),'historical maintenance does not masquerade as a fresh search');
+ assert.ok(h.t.sourceStatus().includes('частина напрямів очікує перевірки'));checks++;
+}
+
+{
+ const h=harness(), recent={start:'2026-11-18T12:30:00Z',endExclusive:'2026-11-18T13:35:00Z'};
+ const html=h.t.hourlyProgress({collectionHealth:{lanes:{context:{freshness:'current'}}},hourly:{lanes:{context:{latestSuccessAt:'2026-11-18T13:35:00Z',latestRange:recent}},
+  pendingWindows:[{discoveryLane:'context',...recent},{discoveryLane:'context',start:'2026-11-01T00:00:00Z',endExclusive:'2026-11-02T00:00:00Z'}],
+  cycle:{status:'partial',startedAt:'2026-11-18T13:35:00Z',finishedAt:'2026-11-18T13:36:00Z',requestCount:3,source:'<script>private details</script>'}}});
+ assert.ok(html.includes('Продовжень свіжого пошуку: 1'));assert.ok(html.includes('Вікон у черзі: 2'));
+ assert.ok(html.includes('Виконано частково'));assert.ok(html.includes('Запитів у запуску: 3'));
+ assert.ok(!html.includes('private details'));checks++;
+}
+
+{
  const h=harness();
  const base={id:'untrusted-context',relevance:{version:'entropy-context-v1',status:'review',reasonCodes:['AMBIGUOUS_ENTROPY'],signals:['fake_official_domain']}};
  assert.ok(!h.t.relevanceSummary(base).includes('Посилання на офіційний ресурс'));

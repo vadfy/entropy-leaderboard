@@ -412,11 +412,14 @@ function laneState(hourly, lane = 'direct') { return hourly.lanes[lane]; }
 function mirrorDirect(hourly) {
   const direct = laneState(hourly);
   for (const key of ['latestPlannedThrough', 'completedRanges', 'completedThrough', 'coverageFrom', 'lastAuditDay', 'lastAuditAt', 'lastAuditRange']) hourly[key] = direct[key] ?? null;
+  for (const [key, source] of Object.entries({ nextRunAt: 'latestNextRunAt', lastAttemptAt: 'latestAttemptAt', lastSuccessAt: 'latestSuccessAt', lastDataAt: 'latestDataAt', lastError: 'latestError', latestWindow: 'latestWindow' })) {
+    if (Object.hasOwn(direct, source)) hourly[key] = direct[source] ?? null;
+  }
 }
 function hourlyCheckpoint(sync, at) {
   const hourly = copy(sync.hourly || {});
   const changed = hourly.queryPolicy !== DISCOVERY_QUERY_POLICY;
-  hourly.version = 3; hourly.target = TARGET; hourly.method = 'search';
+  hourly.version = 4; hourly.target = TARGET; hourly.method = 'search';
   hourly.pendingWindows = Array.isArray(hourly.pendingWindows) ? hourly.pendingWindows : [];
   hourly.completedRanges = Array.isArray(hourly.completedRanges) ? hourly.completedRanges : [];
   hourly.gaps = Array.isArray(hourly.gaps) ? hourly.gaps : [];
@@ -442,14 +445,23 @@ function hourlyCheckpoint(sync, at) {
   }
   for (const lane of DISCOVERY_LANES) {
     const value = laneState(hourly, lane);
+    // Existing flat latest timestamps describe direct discovery only. A broad
+    // lane's generic lastSuccessAt may be a historical maintenance page.
+    if (lane === 'direct') {
+      for (const [key, source] of Object.entries({ latestNextRunAt: 'nextRunAt', latestNextAttemptAt: 'nextAttemptAt', latestAttemptAt: 'lastAttemptAt', latestSuccessAt: 'lastSuccessAt', latestDataAt: 'lastDataAt', latestError: 'lastError', latestWindow: 'latestWindow' })) {
+        if (!Object.hasOwn(value, key)) value[key] = hourly[source] ?? (key === 'latestNextRunAt' ? sync.nextRunAt : null);
+      }
+    }
     value.completedRanges = Array.isArray(value.completedRanges) ? value.completedRanges : [];
-    for (const key of ['latestPlannedThrough', 'completedThrough', 'coverageFrom', 'lastAttemptAt', 'lastSuccessAt', 'lastDataAt']) value[key] = timestamp(value[key]);
+    for (const key of ['latestPlannedThrough', 'completedThrough', 'coverageFrom', 'lastAttemptAt', 'lastSuccessAt', 'lastDataAt', 'latestNextRunAt', 'latestNextAttemptAt', 'latestAttemptAt', 'latestSuccessAt', 'latestDataAt', 'latestContinuationAttemptAt', 'latestContinuationAt']) value[key] = timestamp(value[key]);
+    value.latestError ||= null; value.latestWindow ||= null; value.latestContinuationError ||= null;
     for (const window of hourly.pendingWindows.filter(window => window.discoveryLane === lane)) if (!value.coverageFrom || Date.parse(window.start) < Date.parse(value.coverageFrom)) value.coverageFrom = window.start;
   }
   hourly.queryPolicy = DISCOVERY_QUERY_POLICY;
-  for (const key of ['requestCount', 'searchPages', 'latestPages', 'catchupPages', 'addedPosts', 'splitWindows']) hourly[key] = Number.isInteger(hourly[key]) && hourly[key] >= 0 ? hourly[key] : 0;
+  if (!Object.hasOwn(hourly, 'providerNextAttemptAt') && [sync.lastError, hourly.lastError, hourly.catchupLastError].some(error => error?.code === 'RATE_LIMITED' || error?.diagnosticCode === 'RATE_LIMITED')) hourly.providerNextAttemptAt = timestamp(hourly.nextAttemptAt) || timestamp(sync.nextRunAt);
+  for (const key of ['requestCount', 'searchPages', 'latestPages', 'freshPages', 'freshRequestCount', 'catchupPages', 'addedPosts', 'splitWindows']) hourly[key] = Number.isInteger(hourly[key]) && hourly[key] >= 0 ? hourly[key] : 0;
   hourly.catchupRequestCount = Number.isInteger(hourly.catchupRequestCount) && hourly.catchupRequestCount >= 0 ? hourly.catchupRequestCount : hourly.catchupPages;
-  for (const key of ['lastAttemptAt', 'lastSuccessAt', 'lastDataAt', 'nextRunAt', 'nextAttemptAt', 'catchupLastAttemptAt', 'catchupLastSuccessAt']) hourly[key] = timestamp(hourly[key]);
+  for (const key of ['lastAttemptAt', 'lastSuccessAt', 'lastDataAt', 'nextRunAt', 'nextAttemptAt', 'providerNextAttemptAt', 'catchupLastAttemptAt', 'catchupLastSuccessAt']) hourly[key] = timestamp(hourly[key]);
   hourly.lastError ||= null; hourly.catchupLastError ||= null;
   hourly.catchupNextAttemptAt = hourly.nextAttemptAt;
   mirrorDirect(hourly); sync.hourly = hourly; return hourly;
@@ -479,25 +491,35 @@ function prepareHourlyAudit(hourly, nowMs) {
     state.lastAuditRange = { start: new Date(from).toISOString(), endExclusive: new Date(until).toISOString() };
   }
 }
-function prepareHourlyLatest(sync, hourly, nowMs) {
+function prepareHourlyLatest(sync, hourly, nowMs, lane = 'direct') {
   const until = Math.floor(nowMs / 1000) * 1000;
-  let direct = null;
-  for (const lane of DISCOVERY_LANES) {
-    const state = laneState(hourly, lane);
-    const previous = Date.parse(state.latestPlannedThrough) || (lane === 'direct' ? Date.parse(sync.discovery.recentThrough) || Date.parse(sync.discovery.recentWindow?.endExclusive) : NaN);
-    if (Number.isFinite(previous) && previous >= until) continue;
-    const from = Math.floor(Math.max(until - HOUR - INTERVAL, Number.isFinite(previous) ? previous - INTERVAL : until - HOUR - INTERVAL) / 1000) * 1000;
-    if (Number.isFinite(previous) && previous < from) {
-      for (let point = previous; point < from;) {
-        const end = Math.min(from, Math.floor(point / DAY) * DAY + DAY);
-        appendHourlyWindow(hourly, hourlyWindow(point, end, 'outage', 'search', lane)); point = end;
-      }
-    }
-    const value = hourlyWindow(from, until, 'latest', 'search', lane); appendHourlyWindow(hourly, value);
-    state.latestPlannedThrough = value.endExclusive; state.latestRange = { start: value.start, endExclusive: value.endExclusive };
-    if (lane === 'direct') direct = hourly.pendingWindows.find(window => window.id === value.id);
+  const state = laneState(hourly, lane);
+  const previous = Date.parse(state.latestPlannedThrough) || (lane === 'direct' ? Date.parse(sync.discovery.recentThrough) || Date.parse(sync.discovery.recentWindow?.endExclusive) : NaN);
+  if (Number.isFinite(previous) && previous >= until) {
+    // v3 could plan an unrequested broad first page. Resume only its untouched
+    // first page; an hourly action must never consume an old saved cursor.
+    return hourly.pendingWindows.find(window => window.discoveryLane === lane && window.kind === 'latest' && window.cursor === '' && window.start === state.latestRange?.start && window.endExclusive === state.latestRange?.endExclusive) || null;
   }
-  return direct;
+  const from = Math.floor(Math.max(until - HOUR - INTERVAL, Number.isFinite(previous) ? previous - INTERVAL : until - HOUR - INTERVAL) / 1000) * 1000;
+  if (Number.isFinite(previous) && previous < from) {
+    for (let point = previous; point < from;) {
+      const end = Math.min(from, Math.floor(point / DAY) * DAY + DAY);
+      appendHourlyWindow(hourly, hourlyWindow(point, end, 'outage', 'search', lane)); point = end;
+    }
+  }
+  const value = hourlyWindow(from, until, 'latest', 'search', lane); appendHourlyWindow(hourly, value);
+  state.latestPlannedThrough = value.endExclusive; state.latestRange = { start: value.start, endExclusive: value.endExclusive };
+  state.latestContinuationError = null; state.latestContinuationWindow = null;
+  return hourly.pendingWindows.find(window => window.id === value.id);
+}
+function chooseHourlyFresh(hourly, lane = 'direct') {
+  const latest = laneState(hourly, lane).latestRange;
+  if (!timestamp(latest?.start) || !timestamp(latest?.endExclusive)) return null;
+  // Whole containment is deliberate: a wide audit/history interval overlapping
+  // this hour must not spend its bounded fresh-page allowance on old posts.
+  return hourly.pendingWindows.filter(window => window.discoveryLane === lane && !window.audit && window.kind !== 'audit' &&
+    Date.parse(window.start) >= Date.parse(latest.start) && Date.parse(window.endExclusive) <= Date.parse(latest.endExclusive))
+    .sort((a, b) => Date.parse(b.start) - Date.parse(a.start) || Date.parse(b.endExclusive) - Date.parse(a.endExclusive))[0] || null;
 }
 function chooseHourlyCatchup(hourly) {
   const oldest = values => [...values].sort((a, b) => Date.parse(a.start) - Date.parse(b.start) || a.id.localeCompare(b.id))[0];
@@ -564,23 +586,26 @@ function promoteHourlyCoverage(hourly, lane = 'direct') {
 
 /**
  * One hourly discovery request. The host reserves one paid attempt and lease.
- * `latest` always searches the current hour first. `catchup` drains one saved
- * page independently of the next hourly due time; it never refreshes metrics.
+ * `latest` starts the selected query lane's current hour with an empty cursor.
+ * `fresh` continues only that lane's current range; historical queues cannot
+ * consume this allowance. `catchup` independently drains older saved work.
  */
-export async function advanceHourlyDiscovery(workbench, { client, now, maxRequests = 1, lane = 'latest' } = {}) {
+export async function advanceHourlyDiscovery(workbench, { client, now, maxRequests = 1, lane = 'latest', discoveryLane = 'direct' } = {}) {
   let dataset = Model.validateDataset(copy(workbench.dataset));
   let state = Model.validateState(copy(workbench.state || Model.initialState()));
   const nowMs = instant(now), at = new Date(nowMs).toISOString();
   const sync = initialSync(workbench.sync, nowMs), result = () => { if (sync.hourly?.lanes) mirrorDirect(sync.hourly); return { dataset, state, sync }; };
-  if (!['latest', 'catchup'].includes(lane) || !Number.isInteger(maxRequests) || maxRequests < 0) throw new Error('Invalid hourly discovery action.');
+  if (!['latest', 'fresh', 'catchup'].includes(lane) || !DISCOVERY_LANES.includes(discoveryLane) || !Number.isInteger(maxRequests) || maxRequests < 0) throw new Error('Invalid hourly discovery action.');
   if (!sync.enabled) { sync.status = 'disabled'; return result(); }
   if (sync.paused || maxRequests === 0) return result();
   const hourly = hourlyCheckpoint(sync, at);
-  const due = lane === 'latest' ? hourly.nextRunAt || sync.nextRunAt : hourly.nextAttemptAt;
+  const selected = laneState(hourly, discoveryLane);
+  if (hourly.providerNextAttemptAt && Date.parse(hourly.providerNextAttemptAt) > nowMs) return result();
+  const due = lane === 'latest' ? selected.latestNextRunAt : lane === 'fresh' ? selected.latestNextAttemptAt : hourly.nextAttemptAt;
   if (due && Date.parse(due) > nowMs) return result();
   migrateHourlyRecent(sync, hourly);
-  const chosen = lane === 'latest' ? prepareHourlyLatest(sync, hourly, nowMs)
-    : chooseHourlyCatchup(hourly);
+  const chosen = lane === 'latest' ? prepareHourlyLatest(sync, hourly, nowMs, discoveryLane)
+    : lane === 'fresh' ? chooseHourlyFresh(hourly, discoveryLane) : chooseHourlyCatchup(hourly);
   if (lane === 'latest') prepareHourlyAudit(hourly, nowMs);
   if (!chosen) return result();
   const index = hourly.pendingWindows.indexOf(chosen), window = copy(chosen);
@@ -589,14 +614,27 @@ export async function advanceHourlyDiscovery(workbench, { client, now, maxReques
   if (!['search', 'mentions'].includes(method) || !client || typeof client[method === 'mentions' ? 'mentionsPage' : 'searchPage'] !== 'function') throw new Error('A read-only collection client is required.');
   const latestDueBefore = hourly.nextRunAt || sync.nextRunAt;
   const queryLane = window.discoveryLane || 'direct', queryState = laneState(hourly, queryLane);
-  sync.phase = 'discovery'; sync.activeLane = lane === 'latest' ? 'hourly-latest' : 'hourly-catchup';
+  const continuation = lane === 'fresh';
+  const nextHour = () => new Date((Math.floor(nowMs / HOUR) + 1) * HOUR).toISOString();
+  const spacing = () => new Date(nowMs + CATCHUP_SPACING).toISOString();
+  const preserveDirectSchedule = () => {
+    mirrorDirect(hourly);
+    if (!sync.paused) sync.nextRunAt = hourly.nextRunAt || latestDueBefore;
+  };
+  const recordWindow = () => {
+    queryState.lastWindow = { ...snapshot };
+    if (lane === 'latest') queryState.latestWindow = { ...snapshot };
+    else if (continuation) queryState.latestContinuationWindow = { ...snapshot };
+  };
+  sync.phase = 'discovery'; sync.activeLane = 'hourly-' + lane;
   sync.lastAttemptAt = at; sync.requestCount++; hourly.requestCount++;
   queryState.lastAttemptAt = at;
-  if (lane === 'latest') hourly.lastAttemptAt = at;
+  if (lane === 'latest') queryState.latestAttemptAt = at;
+  else if (continuation) { queryState.latestContinuationAttemptAt = at; hourly.freshRequestCount++; }
   else { hourly.catchupLastAttemptAt = at; hourly.catchupRequestCount++; }
   const snapshot = { start: window.start, endExclusive: window.endExclusive, method, lane, discoveryLane: queryLane, status: 'pending' };
   hourly.lastWindow = snapshot;
-  if (lane === 'latest') hourly.latestWindow = { ...snapshot };
+  recordWindow();
   try {
     const query = window.query || discoveryQuery(window.start, window.endExclusive, window.queryPolicy || 'legacy-unfiltered', queryLane);
     const page = method === 'mentions'
@@ -612,7 +650,7 @@ export async function advanceHourlyDiscovery(workbench, { client, now, maxReques
     const empty = page.hasNextPage && !page.tweets.length;
     dataset = merged; state = migrated;
     const added = incoming.posts.filter(post => !oldIds.has(post.id)).length;
-    hourly.searchPages++; hourly[lane === 'latest' ? 'latestPages' : 'catchupPages']++;
+    hourly.searchPages++; hourly[lane === 'latest' ? 'latestPages' : continuation ? 'freshPages' : 'catchupPages']++;
     hourly.addedPosts += added; hourly.lastPageAdded = added;
     window.observedPostIds = [...new Set([...(window.observedPostIds || []), ...incoming.posts.map(post => post.id)])];
     delete window.consecutiveTimeouts;
@@ -632,37 +670,38 @@ export async function advanceHourlyDiscovery(workbench, { client, now, maxReques
       }
     }
     sync.lastSuccessAt = at; sync.lastError = null; sync.consecutiveFailures = 0; sync.status = 'running';
-    queryState.lastSuccessAt = at; queryState.lastError = null; queryState.lastWindow = { ...snapshot };
+    queryState.lastSuccessAt = at; queryState.lastError = null; recordWindow();
     if (incoming.posts.length) queryState.lastDataAt = at;
-    if (incoming.posts.length) { sync.lastDataAt = at; if (lane === 'latest') hourly.lastDataAt = at; }
-    if (lane === 'latest') { hourly.lastSuccessAt = at; hourly.lastError = null; hourly.latestWindow = { ...snapshot }; }
-    else { hourly.catchupLastSuccessAt = at; hourly.catchupLastError = null; }
-    hourly.nextAttemptAt = new Date(nowMs + CATCHUP_SPACING).toISOString();
+    if (incoming.posts.length) { sync.lastDataAt = at; if (lane !== 'catchup') queryState.latestDataAt = at; }
     if (lane === 'latest') {
-      hourly.nextRunAt = new Date((Math.floor(nowMs / HOUR) + 1) * HOUR).toISOString(); sync.nextRunAt = hourly.nextRunAt;
-    } else sync.nextRunAt = latestDueBefore;
+      queryState.latestSuccessAt = at; queryState.latestError = null; queryState.latestNextRunAt = nextHour();
+    } else if (continuation) { queryState.latestContinuationAt = at; queryState.latestContinuationError = null; }
+    else { hourly.catchupLastSuccessAt = at; hourly.catchupLastError = null; }
+    hourly.nextAttemptAt = spacing();
+    if (lane !== 'catchup') queryState.latestNextAttemptAt = spacing();
+    preserveDirectSchedule();
   } catch (error) {
     if (error?.code === 'INVALID_RESPONSE' && error?.message === 'Некоректний курсор наступної сторінки.') {
       snapshot.status = replaceHourlyWithSplit(sync, hourly, index, window, 'CURSOR_CYCLE', at);
       hourly.lastAnomaly = { code: 'CURSOR_CYCLE', at };
-      hourly.nextAttemptAt = new Date(nowMs + CATCHUP_SPACING).toISOString();
-      if (lane === 'latest') {
-        hourly.latestWindow = { ...snapshot };
-        hourly.nextRunAt = new Date((Math.floor(nowMs / HOUR) + 1) * HOUR).toISOString(); sync.nextRunAt = hourly.nextRunAt;
-      } else sync.nextRunAt = latestDueBefore;
+      hourly.nextAttemptAt = spacing();
+      if (lane === 'latest') queryState.latestNextRunAt = nextHour();
+      if (lane !== 'catchup') queryState.latestNextAttemptAt = spacing();
+      recordWindow(); preserveDirectSchedule();
       hourly.catchupNextAttemptAt = hourly.nextAttemptAt;
       return result();
     }
     recordError(sync, error, nowMs); snapshot.status = 'error';
-    queryState.lastError = copy(sync.lastError); queryState.lastWindow = { ...snapshot };
+    queryState.lastError = copy(sync.lastError); recordWindow();
     hourly.nextAttemptAt = sync.nextRunAt;
+    if (sync.lastError.code === 'RATE_LIMITED' || sync.lastError.diagnosticCode === 'RATE_LIMITED') hourly.providerNextAttemptAt = sync.nextRunAt;
     if (lane === 'latest') {
-      hourly.lastError = copy(sync.lastError); hourly.latestWindow = { ...snapshot };
-      hourly.nextRunAt = new Date(Math.max((Math.floor(nowMs / HOUR) + 1) * HOUR, Date.parse(sync.nextRunAt))).toISOString(); sync.nextRunAt = hourly.nextRunAt;
-    } else {
-      hourly.catchupLastError = copy(sync.lastError);
-      if (!sync.paused) sync.nextRunAt = latestDueBefore;
-    }
+      queryState.latestError = copy(sync.lastError);
+      queryState.latestNextRunAt = new Date(Math.max(Date.parse(nextHour()), Date.parse(sync.nextRunAt))).toISOString();
+    } else if (continuation) queryState.latestContinuationError = copy(sync.lastError);
+    else hourly.catchupLastError = copy(sync.lastError);
+    if (lane !== 'catchup') queryState.latestNextAttemptAt = sync.nextRunAt;
+    preserveDirectSchedule();
     if (sync.lastError?.diagnosticCode === 'REQUEST_TIMEOUT' && !sync.paused) {
       window.consecutiveTimeouts = (window.consecutiveTimeouts || 0) + 1;
       hourly.pendingWindows[index] = window;
@@ -670,9 +709,11 @@ export async function advanceHourlyDiscovery(workbench, { client, now, maxReques
         snapshot.status = replaceHourlyWithSplit(sync, hourly, index, window, 'REQUEST_TIMEOUT', at);
         hourly.lastAnomaly = { code: 'REQUEST_TIMEOUT', at };
         sync.consecutiveFailures = 0; sync.lastError = null; sync.status = 'running';
-        hourly.nextAttemptAt = new Date(nowMs + CATCHUP_SPACING).toISOString();
-        if (lane === 'latest') hourly.latestWindow = { ...snapshot };
-        else hourly.catchupLastError = null;
+        hourly.nextAttemptAt = spacing();
+        if (lane !== 'catchup') queryState.latestNextAttemptAt = spacing();
+        if (continuation) queryState.latestContinuationError = null;
+        else if (lane === 'catchup') hourly.catchupLastError = null;
+        recordWindow();
       }
     } else if (window.consecutiveTimeouts) {
       delete window.consecutiveTimeouts; hourly.pendingWindows[index] = window;
