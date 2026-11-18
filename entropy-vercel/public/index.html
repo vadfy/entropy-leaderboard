@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Публічний рейтинг кріейторів Entropy та їхні зараховані пости.">
+  <title>Entropy — Contributors</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Перейти до вмісту</a>
+  <div class="app-shell">
+    <header class="app-header">
+      <a class="brand" href="/" aria-label="Entropy Contributors — головна"><span class="brand-name">entropy<span>.</span></span><span class="brand-divider" aria-hidden="true">/</span><span class="brand-product">Contributors</span></a>
+      <span class="nav-current">Лідерборд</span>
+      <span class="public-label"><span class="status-dot" aria-hidden="true"></span>Публічний перегляд</span>
+    </header>
+    <main id="main-content">
+      <div class="section-heading">
+        <div><div class="eyebrow">ENTROPY CONTRIBUTORS</div><h1>Лідерборд кріейторів</h1><p class="intro">Внесок спільноти <a href="https://x.com/entropyIO" target="_blank" rel="noopener noreferrer">@entropyIO ↗</a></p></div>
+        <div class="refresh-info"><span id="update-label">Завантажуємо рейтинг</span><button type="button" class="text-button" id="refresh-button" hidden>Спробувати знову ↻</button></div>
+      </div>
+      <div class="filters" aria-label="Фільтри лідерборду">
+        <label class="field search-field"><span>Пошук автора</span><input id="search" type="search" placeholder="Ім’я або @username" autocomplete="off" maxlength="160" disabled></label>
+        <label class="field"><span>Період</span><select id="period" disabled><option>Завантаження…</option></select></label>
+        <label class="field"><span>Сортування</span><select id="sort" disabled><option value="impressions">За переглядами ↓</option><option value="likes">За лайками ↓</option><option value="replies">За коментарями ↓</option><option value="engagementRate">За Engagement % ↓</option><option value="score" id="score-option">За Score ↓</option></select></label>
+      </div>
+      <div class="freshness-note" id="freshness-note"></div>
+      <div class="summary-row" id="summary"></div>
+      <section class="top-creators" id="top-creators" aria-label="Лідери поточного рейтингу" hidden></section>
+      <div class="board-heading"><h2 id="table-heading">Рейтинг</h2><span id="result-count" class="subtle"></span></div>
+      <div class="board-layout" id="board-layout">
+        <div class="table-region">
+          <div class="table-scroll" role="region" aria-labelledby="table-heading" tabindex="0" id="table-scroll" hidden>
+            <table class="leaderboard-table" aria-label="Рейтинг кріейторів Entropy">
+              <thead><tr><th scope="col" class="place-column">#</th><th scope="col" class="author-column">Кріейтор</th><th scope="col" class="num score-column" data-metric="score">Score</th><th scope="col" class="num">Пости</th><th scope="col" class="num" data-metric="impressions">Перегляди</th><th scope="col" class="num" data-metric="engagementRate" title="(Лайки + репости + цитати) / перегляди × 100. Лише зараховані пости за місяць.">Engagement %</th><th scope="col" class="num" data-metric="likes">Лайки</th><th scope="col" class="num" data-metric="replies">Коментарі</th><th scope="col" class="num">Репости</th><th scope="col" class="num">Цитати</th><th scope="col"><span class="sr-only">Переглянути автора</span></th></tr></thead>
+              <tbody id="leaderboard-body"></tbody>
+            </table>
+          </div>
+          <div class="empty-state" id="leaderboard-empty" aria-live="polite"><span class="empty-mark" aria-hidden="true">↗</span><h2>Завантажуємо рейтинг</h2><p>Підбираємо останні доступні дані.</p></div>
+          <p class="table-note">Враховуємо окремі твіти й цитати про Entropy: згадки @entropyIO, офіційні посилання та підтверджений контекст проєкту. Неоднозначні збіги проходять перевірку. Реплаї та звичайні репости не враховуємо. Engagement % = (лайки + репости + цитати) / перегляди × 100 за зарахованими постами місяця. Коментарі під цими постами показані окремо. «—» — показник ще невідомий.</p>
+          <p class="table-note score-note" id="score-note"></p>
+        </div>
+        <aside class="detail-panel" id="detail-panel" aria-label="Пости кріейтора" hidden></aside>
+      </div>
+    </main>
+    <footer class="app-footer"><span>entropy. Contributors</span><span>Збір нових постів — щогодини · доступ лише для перегляду</span></footer>
+  </div>
+  <noscript><p class="noscript">Щоб переглянути актуальний рейтинг, увімкніть JavaScript.</p></noscript>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
