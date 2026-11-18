@@ -82,6 +82,56 @@ test('no-store/private and absent cache policies stay conservative', async () =>
   }
 });
 
+test('a weak Entropy upstream ETag is preserved on a streamed200 response', async () => {
+  const response = await proxy(async () => json('{"revision":42}', {
+    headers: { etag: 'W/"entropy-42"' },
+  }))(request());
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('etag'), 'W/"entropy-42"');
+  assert.equal(await response.text(), '{"revision":42}');
+});
+
+test('GET validators match the same revision across strong and weak tags for304', async () => {
+  for (const clientTag of ['"entropy-42"', 'W/"entropy-42"']) {
+    for (const upstreamTag of ['"entropy-42"', 'W/"entropy-42"']) {
+      const response = await proxy(async (_url, options) => {
+        assert.deepEqual(options.headers, { Accept: 'application/json', 'If-None-Match': '"entropy-42"' });
+        return new Response(null, { status: 304, headers: {
+          etag: upstreamTag, 'cache-control': 'public, max-age=30, stale-while-revalidate=30',
+        } });
+      })(request(undefined, { headers: { 'if-none-match': clientTag } }));
+      assert.equal(response.status, 304, clientTag + ' / ' + upstreamTag);
+      assert.equal(response.headers.get('etag'), upstreamTag);
+      assert.equal(response.headers.get('cache-control'), 'public, max-age=30, stale-while-revalidate=30');
+      assert.equal(await response.text(), '');
+    }
+  }
+});
+
+test('weak tags cannot authorize unsolicited304 or a different snapshot revision', async () => {
+  for (const clientTag of [null, '"entropy-41"', 'W/"entropy-41"', 'W/"entropy-empty"']) {
+    const response = await proxy(async () => new Response(null, { status: 304,
+      headers: { etag: 'W/"entropy-42"', 'cache-control': 'public, max-age=30' } }))(request(undefined,
+        clientTag ? { headers: { 'if-none-match': clientTag } } : {}));
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(response.headers.get('etag'), null);
+  }
+});
+
+test('only the existing Entropy namespace may use weak validators', async () => {
+  const invalid = ['W/"other"', 'w/"entropy-42"', 'W/entropy-42', 'W/"entropy-next"',
+    'W/"entropy-42", "entropy-43"', 'W/"entropy-42"suffix', 'W/"entropy-' + '1'.repeat(128) + '"'];
+  for (const validator of invalid) {
+    const response = await proxy(async (_url, options) => {
+      assert.deepEqual(options.headers, { Accept: 'application/json' });
+      return json();
+    })(request(undefined, { headers: { 'if-none-match': validator } }));
+    assert.equal(response.status, 200);
+    await response.text();
+  }
+});
+
 test('unsupported validators are not forwarded; unsolicited/mismatched304 fails closed', async () => {
   for (const validator of ['*', '"other"', '"entropy-42", "entropy-43"', 'x'.repeat(1024)]) {
     const response = await proxy(async (_url, options) => {
