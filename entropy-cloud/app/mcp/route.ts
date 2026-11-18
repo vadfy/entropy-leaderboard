@@ -1,10 +1,10 @@
-import { getStatus, runSync, WorkbenchError } from '../../lib/workbench';
+import { getStatus, runHourlyCycle, WorkbenchError } from '../../lib/workbench';
 
 export const dynamic = 'force-dynamic';
 const VERSION = '2026-07-28';
 const tools = [
   { name: 'entropy_status', description: 'Read Entropy collector status and usage without exposing credentials or moderation notes.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'entropy_sync', description: 'Run at most one due, enabled Entropy collection tick. Honors pause, server key, revision lease and daily allowance. Never enables or resumes the collector.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'entropy_sync', description: 'Run one bounded due hourly Entropy cycle: tagged, official-link and contextual searches before fresh pagination. Honors pause, provider cooldown, server key, revision lease and daily allowance. Never enables or resumes the collector.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
 ];
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
 const rpcError = (id: unknown, code: number, message: string) => json({ jsonrpc: '2.0', id: id ?? null, error: { code, message } });
@@ -47,7 +47,7 @@ export async function POST(request: Request) {
   try {
     let summary;
     if (name === 'entropy_sync') {
-      const result = await runSync();
+      const result = await runHourlyCycle('mcp');
       summary = { revision: result.revision, updatedAt: result.updatedAt, mode: result.mode, connection: result.connection,
         sync: result.sync, authors: result.dataset.authors.length, posts: result.dataset.posts.length };
     } else summary = await getStatus();
