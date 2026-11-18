@@ -56,6 +56,80 @@ test('thread parts share one work for eligibility and posting boost', () => {
   const a=M.aggregateAuthor(d,M.initialState(),author,period);
   assert.equal(a.posts.length,2);assert.equal(a.works.length,1);assert.equal(a.score.status,'ineligible');
 });
+function tweetPolicyFixture() {
+  const d = structuredClone(data), base = d.posts.find(p => p.authorId === author.id);
+  const make = (id, facts = {}) => ({ ...base, id, workId: id, date: '2026-11-10',
+    url: 'https://x.com/louisdives/status/' + id, body: id + ' saved body',
+    metrics: { impressions: 1000, likes: 10, reposts: 2, uiReposts: 2, quotes: 1, replies: 5, bookmarks: 0 }, ...facts });
+  d.posts = [
+    make('root', { conversationId: 'different-legacy-conversation' }),
+    make('quote', { isQuote: true, isReply: false, inReplyToId: null }),
+    make('reply', { isReply: true }),
+    make('self-reply', { isReply: false, inReplyToId: 'root', workId: 'root' }),
+    make('reply-quote', { isQuote: true, inReplyToId: 'root' }),
+    make('repost', { isRetweet: true }),
+  ];
+  d.accounts = []; d.followRelations = [];
+  d.interactions = [
+    { authorId: author.id, postId: 'root', accountId: 'root-respondent', type: 'reply', meaningful: true, occurredAt: '2026-11-10T12:00:00Z' },
+    { authorId: author.id, postId: 'reply', accountId: 'ignored-respondent', type: 'quote', meaningful: true, occurredAt: '2026-11-10T12:00:00Z' },
+  ];
+  return M.validateDataset(d);
+}
+test('only original and top-level quote tweets contribute metrics, work counts, ER and smart engagement', () => {
+  const d = tweetPolicyFixture(), before = structuredClone(d), state = M.initialState();
+  // Even missing or extreme counters on ignored records cannot poison ranking.
+  d.posts.find(p => p.id === 'reply').metrics.impressions = null;
+  d.posts.find(p => p.id === 'self-reply').metrics.likes = 999999;
+  const a = M.aggregateAuthor(d, state, author, period);
+  assert.deepEqual(a.posts.map(p => p.id), ['root', 'quote']);
+  assert.equal(a.allPosts.length, 6); assert.equal(a.eligiblePosts.length, 2); assert.equal(a.ignoredPosts.length, 4);
+  assert.equal(a.works.length, 2); assert.equal(a.metrics.impressions, 2000); assert.equal(a.metrics.likes, 20);
+  assert.equal(a.metrics.replies, 10); assert.equal(a.score.components.ERpercent, 1.3);
+  assert.deepEqual(a.smart.engagement.unknownAccountIds, ['root-respondent']);
+  const clean = { ...d, posts: d.posts.filter(p => ['root', 'quote'].includes(p.id)) };
+  assert.deepEqual(a.score, M.aggregateAuthor(clean, state, author, period).score);
+  assert.deepEqual(state, M.initialState());
+  assert.deepEqual(d.posts.map(p => p.id), before.posts.map(p => p.id));
+});
+test('positive reply or repost facts override false flags without inferring missing legacy facts', () => {
+  for (const facts of [{ isReply: true }, { isReply: false, inReplyToId: '123' }, { inReplyToId: 123 }, { isQuote: true, inReplyToId: '123' }]) {
+    assert.deepEqual(M.postEligibility(facts), { eligible: false, reason: 'reply' });
+  }
+  for (const facts of [{ isRetweet: true }, { isRepost: true }, { retweeted_tweet: {} }, { retweetedTweetId: '123' }, { repostedTweetId: '123' }]) {
+    assert.deepEqual(M.postEligibility(facts), { eligible: false, reason: 'repost' });
+  }
+  for (const facts of [{}, { isReply: false, inReplyToId: '' }, { id: '123', conversationId: '456' }, { isQuote: true }]) {
+    assert.deepEqual(M.postEligibility(facts), { eligible: true, reason: null });
+  }
+});
+test('replies cannot satisfy the two-work requirement or be reinstated by manual restoration', () => {
+  const d = tweetPolicyFixture(); d.posts = d.posts.filter(p => ['root', 'self-reply'].includes(p.id));
+  let state = M.decision(M.initialState(), { type: 'exclude-post', authorId: author.id, postId: 'self-reply', reason: 'Older manual decision' }, '2026-11-17T12:00:00Z');
+  state = M.decision(state, { type: 'restore-post', authorId: author.id, postId: 'self-reply' }, '2026-11-17T12:01:00Z');
+  let a = M.aggregateAuthor(d, state, author, period);
+  assert.equal(a.posts.length, 1); assert.equal(a.works.length, 1); assert.equal(a.score.status, 'ineligible');
+  d.posts = d.posts.filter(p => p.id === 'self-reply');
+  a = M.aggregateAuthor(d, state, author, period);
+  assert.equal(a.status, 'no-posts'); assert.equal(a.participates, false); assert.equal(a.metrics.impressions, 0);
+  assert.equal(a.allPosts.length, 1); assert.equal(state.audit.length, 2);
+  state = M.decision(state, { type: 'ban', authorId: author.id, reason: 'Existing author ban' }, '2026-11-17T12:02:00Z');
+  assert.equal(M.aggregateAuthor(d, state, author, period).status, 'banned');
+});
+test('dataset imports and backups retain reply history and decisions without reintroducing it to creator-facing records', () => {
+  const d = tweetPolicyFixture();
+  const state = M.decision(M.initialState(), { type: 'exclude-post', authorId: author.id, postId: 'reply', reason: 'Reply history reason', internalNote: 'PRIVATE_REPLY_NOTE' }, '2026-11-17T12:00:00Z');
+  const restored = JSON.parse(JSON.stringify({ dataset: d, state }));
+  const imported = M.validateDataset(restored.dataset), importedState = M.validateState(restored.state);
+  const reconciled = M.reconcileImport(d, imported, importedState);
+  const a = M.aggregateAuthor(imported, reconciled, author, period);
+  assert.equal(a.posts.length, 2); assert.equal(a.allPosts.length, 6);
+  assert.equal(reconciled.postExclusions.reply.reason, 'Reply history reason');
+  assert.equal(reconciled.audit.length, 1);
+  const publicView = M.creatorView(imported, reconciled, author.id, period);
+  assert.equal(publicView.includedPosts, 2); assert.deepEqual(publicView.excludedPosts, []);
+  assert.ok(!JSON.stringify(publicView).includes('Reply history reason')); assert.ok(!JSON.stringify(publicView).includes('PRIVATE_REPLY_NOTE'));
+});
 test('a completeness flag does not hide a missing follower population', () => {
   const d=structuredClone(data);const a=d.authors.find(a=>a.id===author.id);a.followers=10000;a.smartFollowersComplete=true;
   const row=M.aggregateAuthor(d,M.initialState(),a,period);assert.equal(row.smartFollowersComplete,false);
@@ -221,4 +295,79 @@ test('identity evidence validation is bounded, detached and backward compatible'
   const oversized = M.initialState();
   oversized.identityEvidence.large = { id: 'large', handle: 'large', postIds: Array.from({ length: 100001 }, (_, n) => String(n)) };
   assert.throws(() => M.validateState(oversized), /завеликий/);
+});
+
+function contextFixture() {
+  const base = data.posts.find(post => post.authorId === author.id);
+  const relevance = status => ({ version: 'entropy-context-v1', status, reasonCodes: [status === 'accepted' ? 'OFFICIAL_DOMAIN' : status === 'review' ? 'AMBIGUOUS_ENTROPY' : 'OTHER_PROJECT'], signals: [status === 'accepted' ? 'official_domain' : 'brand_name'] });
+  return M.validateDataset({ ...data, authors: [author], posts: [
+    { ...base, id: 'context-confirmed', date: '2026-11-15', relevance: relevance('accepted'), metrics: { impressions: 1000, likes: 10, reposts: 2, quotes: 1, replies: 9 } },
+    { ...base, id: 'context-pending', date: '2026-11-16', body: 'Entropy is early', relevance: relevance('review'), metrics: { impressions: 9000, likes: 300, reposts: 20, quotes: 10, replies: 50 } },
+    { ...base, id: 'context-other', date: '2026-11-17', relevance: relevance('rejected'), metrics: { impressions: 99999, likes: 999, reposts: 99, quotes: 99, replies: 99 } },
+    { ...base, id: 'context-reply', date: '2026-11-18', isReply: true, relevance: relevance('review'), metrics: { impressions: 100000, likes: 9000, reposts: 99, quotes: 99, replies: 99 } },
+  ] });
+}
+test('pending and rejected Entropy contexts cannot enter any aggregate or satisfy eligibility', () => {
+  const source = contextFixture(), state = M.initialState(), month = M.periodFor('2026-11', source);
+  const aggregate = M.aggregateAuthor(source, state, author, month);
+  assert.deepEqual(aggregate.posts.map(post => post.id), ['context-confirmed']);
+  assert.equal(aggregate.metrics.impressions, 1000); assert.equal(aggregate.metrics.likes, 10); assert.equal(aggregate.metrics.replies, 9);
+  assert.equal(aggregate.score.components.ERpercent, 1.3); assert.equal(aggregate.works.length, 1);
+  assert.equal(aggregate.score.status, 'ineligible');
+  assert.deepEqual(M.relevanceQueue(source, state).map(post => post.id), ['context-pending']);
+  assert.equal(M.relevanceQueue(source, state, 'early').length, 1); assert.equal(M.relevanceQueue(source, state, 'absent').length, 0);
+  assert.equal(M.postEligibility(source.posts[1]).eligible, true, 'collector type policy remains independent');
+});
+test('manual context approval is auditable while reply type and other moderation still win', () => {
+  const source = contextFixture(), month = M.periodFor('2026-11', source);
+  let state = M.decision(M.initialState(), { type: 'approve-relevance', authorId: author.id, postId: 'context-pending', reason: 'Verified against project announcement', internalNote: 'PRIVATE_CONTEXT_NOTE' }, '2026-11-18T12:00:00Z');
+  state = M.decision(state, { type: 'approve-relevance', authorId: author.id, postId: 'context-reply', reason: 'Cannot override reply policy' }, '2026-11-18T12:01:00Z');
+  assert.deepEqual(M.aggregateAuthor(source, state, author, month).posts.map(post => post.id), ['context-confirmed', 'context-pending']);
+  assert.equal(M.aggregateAuthor(source, state, author, month).metrics.impressions, 10000);
+  assert.equal(M.countablePost(source.posts[3], state).eligible, false);
+  assert.equal(M.relevanceQueue(source, state).length, 0); assert.equal(state.audit[1].type, 'approve-relevance');
+  state = M.decision(state, { type: 'exclude-post', authorId: author.id, postId: 'context-pending', reason: 'Independent exclusion persists' }, '2026-11-18T12:02:00Z');
+  assert.equal(M.aggregateAuthor(source, state, author, month).posts.length, 1);
+  state = M.decision(state, { type: 'ban', authorId: author.id, reason: 'Separate creator decision' }, '2026-11-18T12:03:00Z');
+  assert.equal(M.aggregateAuthor(source, state, author, month).participates, false);
+  assert.ok(!JSON.stringify(M.creatorView(source, state, author.id, month)).includes('PRIVATE_CONTEXT_NOTE'));
+});
+test('manual context rejection survives later accepted classification until explicitly restored', () => {
+  const source = contextFixture(); let state = M.decision(M.initialState(), { type: 'reject-relevance', authorId: author.id, postId: 'context-pending', reason: 'This is a different project' }, '2026-11-18T12:00:00Z');
+  source.posts[1].relevance = structuredClone(source.posts[0].relevance);
+  assert.equal(M.countablePost(source.posts[1], state).eligible, false);
+  state = M.decision(state, { type: 'restore-relevance', authorId: author.id, postId: 'context-pending' }, '2026-11-18T12:01:00Z');
+  assert.equal(M.countablePost(source.posts[1], state).eligible, true);
+  assert.equal(state.audit.length, 2); assert.equal(state.postRelevance['context-pending'], undefined);
+});
+test('context decisions migrate by immutable post ownership and survive an absent dataset', () => {
+  const source = contextFixture(), state = M.decision(M.initialState(), { type: 'reject-relevance', authorId: author.id, postId: 'context-pending', reason: 'Different Entropy', internalNote: 'PRIVATE_MIGRATION_NOTE' }, '2026-11-18T12:00:00Z');
+  const next = structuredClone(source); next.authors[0].id = canonicalId; next.posts.forEach(post => { post.authorId = canonicalId; });
+  const absent = M.reconcileImport(source, { meta: {}, authors: [], posts: [] }, state);
+  const migrated = M.reconcileImport({ meta: {}, authors: [], posts: [] }, next, absent);
+  assert.equal(migrated.postRelevance['context-pending'].authorId, canonicalId);
+  assert.equal(migrated.postRelevance['context-pending'].internalNote, 'PRIVATE_MIGRATION_NOTE');
+  assert.equal(migrated.audit[0].authorId, canonicalId);
+});
+test('legacy state is readable, but malformed context decisions and unsupported automatic proof fail closed', () => {
+  const legacy = M.initialState(); delete legacy.postRelevance;
+  assert.deepEqual(M.validateState(legacy).postRelevance, {});
+  const malformed = M.initialState(); malformed.postRelevance.bad = { action: 'approve', authorId: author.id, reason: 'x', at: '2026-11-18T12:00:00Z' };
+  assert.throws(() => M.validateState(malformed), /рішення перевірки/);
+  for (const relevance of [
+    { version: 'future-unknown', status: 'accepted', reasonCodes: [], signals: [] },
+    { version: 'entropy-context-v1', status: 'accepted', reasonCodes: [], signals: [] },
+    { version: 'entropy-context-v1', status: 'accepted', reasonCodes: ['OFFICIAL_DOMAIN'], signals: ['brand_name'] },
+  ]) {
+    const source = contextFixture(); source.posts[1].relevance = relevance;
+    assert.throws(() => M.validateDataset(source), /належність поста/);
+  }
+  const source = contextFixture(); delete source.posts[0].relevance;
+  assert.equal(M.countablePost(source.posts[0], M.initialState()).eligible, true, 'legacy observations are not silently reclassified');
+});
+test('creator-facing records omit unconfirmed context even when it has an older post exclusion', () => {
+  const source = contextFixture(), state = M.decision(M.initialState(), { type: 'exclude-post', authorId: author.id, postId: 'context-pending', reason: 'PRIVATE_PENDING_REASON' }, '2026-11-18T12:00:00Z');
+  const view = M.creatorView(source, state, author.id, M.periodFor('2026-11', source));
+  assert.equal(view.includedPosts, 1); assert.deepEqual(view.excludedPosts, []);
+  assert.ok(!JSON.stringify(view).includes('context-pending')); assert.ok(!JSON.stringify(view).includes('PRIVATE_PENDING_REASON'));
 });

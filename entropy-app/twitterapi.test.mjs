@@ -192,3 +192,23 @@ test('UTC period is half-open and an empty result retains requested bounds', () 
   assert.equal(data.meta.periodStart, options.periodStart); assert.equal(data.meta.periodEndExclusive, options.periodEndExclusive);
   assert.throws(() => normalizeTweets([], { ...options, periodStart: '2026-02-30' }), { code: 'INVALID_INPUT' });
 });
+
+
+test('reply source facts are retained and absent isReply stays unknown rather than verified original', () => {
+  const values = normalizeTweets([fixture({ id: '111', isReply: true, inReplyToId: '99' }), fixture({ id: '222', isReply: false, inReplyToId: '99' }), fixture({ id: '333' })], { observedAt: '2026-11-17T12:00:00Z' });
+  assert.equal(values.posts[0].isReply, true); assert.equal(values.posts[0].inReplyToId, '99');
+  assert.equal(values.posts[1].isReply, false); assert.equal(values.posts[1].inReplyToId, '99'); assert.equal(values.posts[2].isReply, null);
+});
+
+test('raw expanded URLs and quoted official identity become persisted relevance before source fields are reduced', () => {
+  const data = normalizeTweets([
+    fixture({ id: '100', text: 'Read my notes', entities: { urls: [{ expanded_url: 'https://pro.entropy.io/?r=creator' }] } }),
+    fixture({ id: '101', text: 'This is useful', quoted_tweet: { id: '123', author: { userName: 'entropyIO' } } }),
+    fixture({ id: '102', text: 'Entropy looks interesting' }),
+  ], options);
+  assert.equal(data.posts[0].relevance.status, 'accepted'); assert.ok(data.posts[0].relevance.signals.includes('official_domain'));
+  assert.equal(data.posts[1].relevance.status, 'accepted'); assert.ok(data.posts[1].relevance.signals.includes('official_quote'));
+  assert.equal(data.posts[2].relevance.status, 'review');
+  const roundTrip = Model.validateDataset(JSON.parse(JSON.stringify(data)));
+  assert.deepEqual(roundTrip.posts.map(post => post.relevance), data.posts.map(post => post.relevance));
+});

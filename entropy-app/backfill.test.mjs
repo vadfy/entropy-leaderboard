@@ -17,7 +17,7 @@ function wb(tweets = [], sync = {}) {
       phase: 'refresh', discovery: { pendingWindows: [{ start: START, endExclusive: '2026-11-02T00:00:00Z', cursor: 'old-cursor', seenCursors: [] }], coveredThrough: null },
       refresh: { pendingIds: ['111'], cycleStartedAt: '2026-11-17T12:00:00Z' }, ...sync } };
 }
-const begin = (workbench = wb(), options = {}) => beginBackfill(workbench, { start: START, endExclusive: END, now: NOW, ...options });
+const begin = (workbench = wb(), options = {}) => beginBackfill(workbench, { start: START, endExclusive: END, now: NOW, lanes: ['direct'], ...options });
 const exhausted = tweets => ({ tweets, hasNextPage: false, nextCursor: null });
 const step = (workbench, provider, now) => advanceBackfill(workbench, { client: { searchPage: provider }, now: now || workbench.sync.backfill.nextAttemptAt });
 
@@ -66,12 +66,12 @@ test('start rejects invalid ranges, future cutoffs, malformed dates and implicit
 test('collection methods have separate frozen jobs and cannot reuse an active method cursor', async () => {
   let search = begin();
   search = await step(search, async () => ({ tweets: [tweet('111')], hasNextPage: true, nextCursor: 'search-only-cursor' }));
-  assert.equal(search.sync.backfill.method, 'search'); assert.match(search.sync.backfill.id, /^backfill:search:/);
+  assert.equal(search.sync.backfill.method, 'search'); assert.match(search.sync.backfill.id, /^backfill:entropy-context-v1:direct:search:/);
   assert.throws(() => begin(search, { method: 'mentions' }), /different backfill/);
   assert.throws(() => begin(wb(), { method: 'unexpected' }), /method/);
   const stopped = structuredClone(search); stopped.sync.backfill.status = 'cancelled';
   let mentions = begin(stopped, { method: 'mentions' });
-  assert.match(mentions.sync.backfill.id, /^backfill:mentions:/); assert.equal(mentions.sync.backfill.pendingWindows[0].cursor, '');
+  assert.match(mentions.sync.backfill.id, /^backfill:entropy-context-v1:direct:mentions:/); assert.equal(mentions.sync.backfill.pendingWindows[0].cursor, '');
   assert.equal(mentions.sync.backfill.requestCount, 0); assert.equal(mentions.sync.requestCount, search.sync.requestCount);
   let calls = 0;
   mentions = await advanceBackfill(mentions, { now: mentions.sync.backfill.nextAttemptAt, client: {
@@ -85,21 +85,23 @@ test('collection methods have separate frozen jobs and cannot reuse an active me
   const resumed = begin(mentions, { method: 'mentions', requestLimit: 300 });
   assert.equal(resumed.sync.backfill.requestCount, 1); assert.equal(resumed.sync.backfill.pendingWindows[0].cursor, 'mentions-only-cursor');
 });
-test('legacy search jobs resume their exact ID, paid count and cursor without becoming mentions jobs', () => {
-  const original = begin(); delete original.sync.backfill.method;
+test('new query policy creates an independent re-scan and never reuses an old finished cursor', () => {
+  const original = begin(); delete original.sync.backfill.method; delete original.sync.backfill.queryPolicy;
   original.sync.backfill.id = 'backfill:' + original.sync.backfill.start + ':' + original.sync.backfill.endExclusive;
   original.sync.backfill.pendingWindows[0].cursor = 'legacy-search'; original.sync.backfill.requestCount = 7;
-  const resumed = begin(original);
-  assert.equal(resumed.sync.backfill.id, original.sync.backfill.id); assert.equal(resumed.sync.backfill.method, 'search');
-  assert.equal(resumed.sync.backfill.requestCount, 7); assert.equal(resumed.sync.backfill.pendingWindows[0].cursor, 'legacy-search');
-  assert.throws(() => begin(original, { method: 'mentions' }), /different backfill/);
+  assert.throws(() => begin(original), /different backfill/);
+  original.sync.backfill.status = 'complete';
+  const restarted = begin(original);
+  assert.notEqual(restarted.sync.backfill.id, original.sync.backfill.id);
+  assert.equal(restarted.sync.backfill.queryPolicy, 'entropy-context-v1'); assert.equal(restarted.sync.backfill.requestCount, 0);
+  assert.equal(restarted.sync.backfill.pendingWindows[0].cursor, ''); assert.equal(restarted.sync.requestCount, original.sync.requestCount);
 });
 test('ID-search uses exact BigInt Nov2 bounds and independently enforces the half-open mention window', async () => {
   const original = begin(wb(), { method: 'id-search', start: '2026-11-02T00:00:00Z', endExclusive: '2026-11-03T00:00:00Z', requestLimit: 10 });
-  assert.match(original.sync.backfill.id, /^backfill:id-search:/); assert.equal(original.sync.backfill.method, 'id-search');
+  assert.match(original.sync.backfill.id, /^backfill:entropy-context-v1:direct:id-search:/); assert.equal(original.sync.backfill.method, 'id-search');
   let calls = 0;
   const result = await step(original, async args => {
-    calls++; assert.deepEqual(args, { query: '@entropyIO since_id:2117044012446646271 max_id:2117406400312246271', cursor: '' });
+    calls++; assert.deepEqual(args, { query: '@entropyIO -filter:replies -filter:nativeretweets since_id:2117044012446646271 max_id:2117406400312246271', cursor: '' });
     return exhausted([tweet('2117200000000000001', '2026-11-02T12:00:00Z'),
       tweet('2117000000000000001', '2026-11-01T23:59:59Z'), tweet('2117500000000000001', '2026-11-03T00:00:00Z'),
       tweet('2117200000000000002', '2026-11-02T13:00:00Z', { text: '@entropyIOther' }),
@@ -131,7 +133,7 @@ test('only one direct-mention search page is requested; raw views and missing va
   let count = 0;
   const result = await step(begin(), async ({ query, cursor }) => {
     count++; assert.equal(cursor, '');
-    assert.equal(query, '@entropyIO since_time:1793491200 until_time:1793577600');
+    assert.equal(query, '@entropyIO -filter:replies -filter:nativeretweets since_time:1793491200 until_time:1793577600');
     return exhausted([tweet('111'), tweet('112', '2026-11-01T13:00:00Z', { likeCount: null }),
       tweet('113', '2026-10-31T23:59:59Z'), tweet('114', undefined, { text: '@entropyIOther' }),
       tweet('115', undefined, { author: { id: '201', userName: 'entropyIO' } }), tweet('116', undefined, { isRetweet: true })]);
@@ -139,7 +141,7 @@ test('only one direct-mention search page is requested; raw views and missing va
   assert.equal(count, 1); assert.deepEqual(result.dataset.posts.map(post => post.id), ['111', '112']);
   assert.equal(result.dataset.posts[1].metrics.likes, null); assert.equal(result.sync.backfill.addedPosts, 2);
   assert.equal(result.sync.requestCount, 9); assert.equal(result.sync.backfill.requestCount, 1);
-  assert.deepEqual(result.sync.backfill.lastPageStats, { rawTweets: 6, normalizedNonReposts: 5, inRangeMentions: 2,
+  assert.deepEqual(result.sync.backfill.lastPageStats, { discoveryLane: 'direct', rawTweets: 6, normalizedNonReposts: 5, inRangeMentions: 2,
     oldest: '2026-10-31T23:59:59.000Z', newest: '2026-11-01T13:00:00.000Z' });
   assert.equal(result.sync.backfill.fetchedRawTweets, 6); assert.equal(result.sync.backfill.fetchedNormalizedNonReposts, 5);
   assert.equal(result.sync.backfill.fetchedInRangeMentions, 2);
@@ -197,11 +199,11 @@ test('known direct mentions omitted from exhausted history become counted covera
   while (result.sync.backfill.status === 'running') result = await step(result, async () => exhausted([]));
   const job = result.sync.backfill;
   assert.equal(job.status, 'complete-with-gaps'); assert.equal(job.gaps.length, 1);
-  assert.deepEqual(job.gaps[0], { code: 'KNOWN_POST_NOT_RETURNED', count: 2, at: job.gaps[0].at,
+  assert.deepEqual(job.gaps[0], { code: 'KNOWN_POST_NOT_RETURNED', count: 2, at: job.gaps[0].at, discoveryLane: 'direct',
     start: '2026-11-02T00:00:00.000Z', endExclusive: '2026-11-03T00:00:00.000Z' });
   assert.equal(result.sync.discovery.coveredThrough, null); assert.equal(result.dataset.posts.length, 3);
   assert.equal(job.measuredPages, 3); assert.equal(job.fetchedRawTweets, 0);
-  assert.deepEqual(job.lastPageStats, { rawTweets: 0, normalizedNonReposts: 0, inRangeMentions: 0, oldest: null, newest: null });
+  assert.deepEqual(job.lastPageStats, { discoveryLane: 'direct', rawTweets: 0, normalizedNonReposts: 0, inRangeMentions: 0, oldest: null, newest: null });
   assert.equal(JSON.stringify(job.gaps).includes('111'), false);
 });
 test('known-post observations survive cursor checkpoints and retain cumulative measured counts', async () => {
@@ -284,4 +286,80 @@ test('malformed pages and ownership conflicts never commit data or consume the s
   const result = await step(original, async () => exhausted([tweet('111', undefined, { author: { id: '999', userName: 'other' } })]));
   assert.deepEqual(result.dataset, before); assert.equal(result.sync.backfill.pendingWindows[0].cursor, 'original');
   assert.equal(result.sync.backfill.lastError.diagnosticCode, 'POST_OWNERSHIP_CONFLICT');
+});
+
+
+test('tweet-only backfill ignores replies in incoming rows and in known-post coverage checks', async () => {
+  const savedReply = tweet('111', '2026-11-01T12:00:00Z', { isReply: true, inReplyToId: '99' });
+  const result = await step(begin(wb([savedReply]), { endExclusive: '2026-11-02' }), async () => exhausted([
+    tweet('112', '2026-11-01T13:00:00Z', { isReply: true }),
+    tweet('113', '2026-11-01T14:00:00Z', { isReply: false, inReplyToId: '99' }), tweet('114')
+  ]));
+  assert.equal(result.sync.backfill.status, 'complete'); assert.deepEqual(result.sync.backfill.gaps, []);
+  assert.deepEqual(result.dataset.posts.map(post => post.id), ['111', '114']);
+  assert.equal(Model.postEligibility(result.dataset.posts[0]).reason, 'reply');
+});
+
+const queryLane = query => query.startsWith('@entropyIO') ? 'direct' : query.startsWith('Entropy ') ? 'context' : 'evidence';
+test('default history scan has three independent lanes; selected lanes are validated and part of job identity', () => {
+  const original = wb(), all = beginBackfill(original, { start: START, endExclusive: '2026-11-02T00:00:00Z', now: NOW });
+  assert.deepEqual(all.sync.backfill.lanes, ['direct', 'evidence', 'context']);
+  assert.deepEqual(all.sync.backfill.pendingWindows.map(value => value.discoveryLane), ['direct', 'evidence', 'context']);
+  assert.equal(new Set(all.sync.backfill.pendingWindows.map(value => value.query)).size, 3);
+  const selected = begin(original, { lanes: ['context', 'evidence'] });
+  assert.deepEqual(selected.sync.backfill.lanes, ['evidence', 'context']);
+  assert.notEqual(selected.sync.backfill.id, begin(original).sync.backfill.id);
+  assert.equal(selected.sync.backfill.id, begin(original, { lanes: ['evidence', 'context'] }).sync.backfill.id);
+  for (const lanes of [[], ['direct', 'direct'], ['other'], 'context']) assert.throws(() => begin(original, { lanes }), /lanes/);
+  assert.throws(() => begin(original, { method: 'mentions', lanes: ['context'] }), /lanes/);
+});
+test('multilane pagination rotates paid pages rather than letting one noisy query consume the job', async () => {
+  let result = beginBackfill(wb(), { start: START, endExclusive: '2026-11-03T00:00:00Z', now: NOW, requestLimit: 6 });
+  const calls = [];
+  while (result.sync.backfill.status === 'running') result = await step(result, async args => {
+    const lane = queryLane(args.query); calls.push({ ...args, lane });
+    const at = new Date(Number(args.query.match(/since_time:(\d+)/)[1]) * 1000 + 60000).toISOString();
+    return { tweets: [tweet(String(500 + calls.length), at, { text: lane === 'context' ? 'Shannon entropy and information theory' : '@entropyIO useful' })], hasNextPage: true, nextCursor: lane + '-' + calls.length };
+  });
+  assert.deepEqual(calls.map(value => value.lane), ['direct', 'evidence', 'context', 'direct', 'evidence', 'context']);
+  assert.equal(result.sync.backfill.status, 'request-limit'); assert.equal(result.sync.backfill.pendingWindows.length, 6);
+  for (const window of result.sync.backfill.pendingWindows) assert.equal(queryLane(window.query), window.discoveryLane);
+});
+test('same post returned through three lanes is one work with independent observations and completion', async () => {
+  let result = beginBackfill(wb(), { start: START, endExclusive: '2026-11-02T00:00:00Z', now: NOW });
+  const source = tweet('700', undefined, { text: '@entropyIO documentation https://entropy.io/', entities: { urls: [{ expanded_url: 'https://entropy.io/' }] } });
+  while (result.sync.backfill.status === 'running') result = await step(result, async () => exhausted([source]));
+  assert.equal(result.sync.backfill.status, 'complete'); assert.equal(result.dataset.posts.length, 1); assert.equal(result.sync.backfill.addedPosts, 1);
+  assert.deepEqual([...result.dataset.posts[0].discoveryLanes].sort(), ['context', 'direct', 'evidence']);
+  for (const lane of ['direct', 'evidence', 'context']) {
+    assert.deepEqual(result.sync.backfill.observedByLane[lane], ['700']);
+    assert.equal(result.sync.backfill.completedRanges.filter(range => range.discoveryLane === lane).length, 1);
+  }
+});
+test('a broader-only completed scan does not assert direct-mention coverage', async () => {
+  let result = begin(wb(), { lanes: ['evidence', 'context'], endExclusive: '2026-11-02T00:00:00Z' });
+  const original = structuredClone(result.sync.discovery);
+  while (result.sync.backfill.status === 'running') result = await step(result, async () => exhausted([]));
+  assert.equal(result.sync.backfill.status, 'complete'); assert.deepEqual(result.sync.discovery, original);
+});
+test('historical untagged matches retain review candidates without adding unrelated projects or reply posts', async () => {
+  let result = begin(wb(), { lanes: ['context'], endExclusive: '2026-11-02T00:00:00Z' });
+  result = await step(result, async () => exhausted([
+    tweet('710', undefined, { text: 'Entropy HIP-3 perpetual markets' }),
+    tweet('711', undefined, { text: 'Entropy Creator Program is live' }),
+    tweet('712', undefined, { text: 'Shannon entropy is information theory' }),
+    tweet('713', undefined, { text: 'Pyth Entropy generates randomness' }),
+    tweet('714', undefined, { text: 'Entropy HIP-3 perpetual markets', isReply: true }),
+  ]));
+  assert.deepEqual(result.dataset.posts.map(post => post.id), ['710', '711']);
+  assert.equal(result.dataset.posts[1].relevance.status, 'review'); assert.equal(result.sync.backfill.status, 'complete');
+});
+test('legacy original-only cursor continues with its frozen filtered query after expanding the new policy', async () => {
+  const result = begin(); const job = result.sync.backfill;
+  job.queryPolicy = 'original-tweets-v1'; job.lanes = undefined;
+  job.pendingWindows = [{ start: '2026-11-01T00:00:00Z', endExclusive: '2026-11-02T00:00:00Z', cursor: 'old-policy-only', previousOldest: null, seenCursors: ['old-policy-only'] }];
+  let called;
+  await step(result, async args => { called = args; return exhausted([]); });
+  assert.equal(called.query, '@entropyIO -filter:replies -filter:nativeretweets since_time:1793491200 until_time:1793577600');
+  assert.equal(called.cursor, 'old-policy-only');
 });

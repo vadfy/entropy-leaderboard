@@ -6,7 +6,9 @@ The private workbench discovers mentions hourly in cloud jobs. After each succes
 
 ## Public data
 
-Only permitted calendar-month rows, creator names and handles, scalar eligible scores, public counters and counted posts are mirrored. Unknown counters remain null. Bans, period exclusions and individual post exclusions are applied before publishing; their reasons, internal notes, audit history, identity evidence, private scoring implementation and provider credentials never cross this boundary. Historical coverage remains partial and is labelled as such.
+Only permitted calendar-month rows, creator names and handles, scalar eligible scores, public counters and counted posts are mirrored. Reply posts (including self-replies and thread continuations) and plain reposts are excluded on the private server before projection; original tweets and top-level quote tweets remain eligible. Comments received by those eligible tweets remain visible as a counter. Unknown counters remain null. Bans, period exclusions and individual post exclusions are applied before publishing; their reasons, internal notes, audit history, identity evidence, private scoring implementation and provider credentials never cross this boundary. Historical coverage remains partial and is labelled as such.
+
+Untagged posts may qualify through exact official Entropy links, a quote of the official account, or distinctive verified product context. Ambiguous Entropy name matches remain in the private review queue until approved. A saved rejection overrides later automatic matches; reply/repost exclusions still apply to approvals. Neither candidate bodies nor relevance evidence, review decisions or their reasons are included in the public snapshot.
 
 `GET /api/leaderboard` returns the published snapshot. `POST /internal/snapshot` accepts updates only with the server-side `COMMUNITY_SYNC_SECRET` bearer credential. That secret belongs in Sites runtime secrets and is never in browser assets or repository files. The public Site does not need a Twitter API credential or access to the private workbench.
 

@@ -1,4 +1,5 @@
 // Server-only, read-only adapter. Never import this module into the browser bundle.
+import { classifyTweet } from './relevance.mjs';
 // Reference: https://docs.twitterapi.io/api-reference/endpoint/tweet_advanced_search
 // Reference: https://docs.twitterapi.io/api-reference/endpoint/get_tweet_by_ids
 // Reference: https://docs.twitterapi.io/api-reference/endpoint/get_user_mention
@@ -163,7 +164,8 @@ export function normalizeTweets(tweets, { observedAt, query = '', periodStart, p
       // conversationId is retained as evidence, never used to group other authors' work.
       conversationId: numericId(tweet.conversationId) ? tweet.conversationId : null,
       inReplyToId: numericId(tweet.inReplyToId) ? tweet.inReplyToId : null,
-      isReply: tweet.isReply === true, isQuote: !!tweet.quoted_tweet,
+      isReply: typeof tweet.isReply === 'boolean' ? tweet.isReply : null, isQuote: !!tweet.quoted_tweet,
+      relevance: classifyTweet(tweet),
     });
   }
   const dates = [...posts.values()].map(post => post.date).sort();

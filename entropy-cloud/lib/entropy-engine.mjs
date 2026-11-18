@@ -383,7 +383,11 @@ var require_model = __commonJS({
       const METRICS2 = ["impressions", "likes", "reposts", "uiReposts", "quotes", "replies", "bookmarks"];
       const isNumber = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
       const safeId = (v) => typeof v === "string" && v.trim() === v && v.length > 0 && !["__proto__", "prototype", "constructor"].includes(v);
-      const plain2 = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+      const plain3 = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+      function confirmedRelevance(r) {
+        if (!plain3(r) || r.version !== "entropy-context-v1" || !Array.isArray(r.reasonCodes) || !Array.isArray(r.signals)) return false;
+        return ["DIRECT_MENTION", "OFFICIAL_DOMAIN", "OFFICIAL_POST_LINK", "OFFICIAL_QUOTE"].some((code) => r.reasonCodes.includes(code) && r.signals.includes(code.toLowerCase())) || r.reasonCodes.includes("PROJECT_CONTEXT") && ["brand_name", "product_context"].every((code) => r.signals.includes(code)) && ["hyperliquid_context", "hip3_context"].some((code) => r.signals.includes(code));
+      }
       function isoDate(v) {
         if (typeof v !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
         const n = /* @__PURE__ */ new Date(v + "T00:00:00Z");
@@ -408,20 +412,28 @@ var require_model = __commonJS({
           if (!ids.has(p.authorId)) throw new Error("\u0414\u043B\u044F \u043F\u043E\u0441\u0442\u0430 \u043D\u0435\u043C\u0430\u0454 \u0430\u0432\u0442\u043E\u0440\u0430: " + p.id);
           const day2 = p.date || (typeof p.publishedAt === "string" ? p.publishedAt.slice(0, 10) : null);
           if (!isoDate(day2)) throw new Error("\u041D\u0435\u0432\u0456\u0434\u043E\u043C\u0430 \u0430\u0431\u043E \u043D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0430 \u0434\u0430\u0442\u0430 \u043F\u043E\u0441\u0442\u0430: " + p.id);
-          let url;
+          let url2;
           try {
-            url = new URL(p.url);
+            url2 = new URL(p.url);
           } catch (_) {
             throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0435 \u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F \u043F\u043E\u0441\u0442\u0430.");
           }
-          if (url.protocol !== "https:" || !["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(url.hostname)) throw new Error("\u0414\u043B\u044F \u043F\u043E\u0441\u0442\u0430 \u043F\u043E\u0442\u0440\u0456\u0431\u043D\u0435 HTTPS-\u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F X.");
+          if (url2.protocol !== "https:" || !["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(url2.hostname)) throw new Error("\u0414\u043B\u044F \u043F\u043E\u0441\u0442\u0430 \u043F\u043E\u0442\u0440\u0456\u0431\u043D\u0435 HTTPS-\u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F X.");
           const metrics = {};
           for (const k of METRICS2) {
             const v = p.metrics?.[k];
             if (v !== null && v !== void 0 && !isNumber(v)) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0430 \u043C\u0435\u0442\u0440\u0438\u043A\u0430 " + k + " \u0443 \u043F\u043E\u0441\u0442\u0456 " + p.id);
             metrics[k] = v ?? null;
           }
-          return { ...p, date: day2, metrics, summary: typeof p.summary === "string" ? p.summary : "", body: typeof p.body === "string" ? p.body : null };
+          let relevance;
+          if (p.relevance !== void 0 && p.relevance !== null) {
+            const r = p.relevance;
+            const codes = (values) => Array.isArray(values) && values.length <= 32 && values.every((v) => typeof v === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(v));
+            const acceptedProof = confirmedRelevance(r);
+            if (!plain3(r) || r.version !== "entropy-context-v1" || !["accepted", "review", "rejected"].includes(r.status) || !codes(r.reasonCodes || []) || !codes(r.signals || []) || r.status === "accepted" && !acceptedProof) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0432\u0438\u0441\u043D\u043E\u0432\u043E\u043A \u043F\u0440\u043E \u043D\u0430\u043B\u0435\u0436\u043D\u0456\u0441\u0442\u044C \u043F\u043E\u0441\u0442\u0430 \u0434\u043E Entropy.");
+            relevance = { ...r, reasonCodes: [...r.reasonCodes || []], signals: [...r.signals || []] };
+          }
+          return { ...p, ...relevance ? { relevance } : {}, date: day2, metrics, summary: typeof p.summary === "string" ? p.summary : "", body: typeof p.body === "string" ? p.body : null };
         });
         const accounts = Array.isArray(raw.accounts) ? raw.accounts : [];
         const accountIds = /* @__PURE__ */ new Set();
@@ -429,7 +441,7 @@ var require_model = __commonJS({
           if (!a || !safeId(a.id) || accountIds.has(a.id)) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0430\u0431\u043E \u043F\u043E\u0432\u0442\u043E\u0440\u043D\u0438\u0439 ID \u0430\u043A\u0430\u0443\u043D\u0442\u0430 \u0430\u0443\u0434\u0438\u0442\u043E\u0440\u0456\u0457.");
           accountIds.add(a.id);
         });
-        const meta = plain2(raw.meta) ? raw.meta : { coverage: "unknown", asOf: null };
+        const meta = plain3(raw.meta) ? raw.meta : { coverage: "unknown", asOf: null };
         for (const k of ["periodStart", "periodEndExclusive"]) if (meta[k] !== void 0 && !isoDate(meta[k])) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0430 \u043C\u0435\u0436\u0430 \u043F\u0435\u0440\u0456\u043E\u0434\u0443 \u0434\u0436\u0435\u0440\u0435\u043B\u0430.");
         return {
           meta,
@@ -458,9 +470,35 @@ var require_model = __commonJS({
         Object.values(reviews || {}).forEach((a) => byId.set(a.id, { ...byId.get(a.id) || {}, ...a }));
         return [...byId.values()];
       }
+      function postEligibility(post) {
+        const reference = (value) => typeof value === "string" ? value.trim().length > 0 : typeof value === "number" && Number.isFinite(value);
+        if (post.isReply === true || reference(post.inReplyToId)) return { eligible: false, reason: "reply" };
+        if (post.isRetweet === true || post.isRepost === true || plain3(post.retweeted_tweet) || reference(post.retweeted_tweet) || reference(post.retweetedTweetId) || reference(post.repostedTweetId)) return { eligible: false, reason: "repost" };
+        return { eligible: true, reason: null };
+      }
+      function relevanceEligibility(post, state = {}) {
+        const decision2 = state.postRelevance?.[post.id];
+        if (decision2?.action === "reject") return { eligible: false, reason: "relevance-rejected", manual: true };
+        if (decision2?.action === "approve") return { eligible: true, reason: "relevance-approved", manual: true };
+        if (!post.relevance) return { eligible: true, reason: "legacy", manual: false };
+        if (post.relevance.status === "accepted") return confirmedRelevance(post.relevance) ? { eligible: true, reason: "relevance-confirmed", manual: false } : { eligible: false, reason: "relevance-review", manual: false };
+        return { eligible: false, reason: post.relevance.status === "review" ? "relevance-review" : "relevance-rejected", manual: false };
+      }
+      function countablePost(post, state = {}) {
+        const kind = postEligibility(post);
+        return kind.eligible ? relevanceEligibility(post, state) : kind;
+      }
+      function relevanceQueue(dataset, state, query = "") {
+        const search = String(query).trim().toLowerCase();
+        const authors = new Map(dataset.authors.map((author) => [author.id, author]));
+        return dataset.posts.filter((post) => postEligibility(post).eligible && relevanceEligibility(post, state).reason === "relevance-review").filter((post) => !search || [post.body, post.summary, authors.get(post.authorId)?.handle, authors.get(post.authorId)?.displayName].join(" ").toLowerCase().includes(search)).sort((a, b) => String(b.publishedAt || b.date).localeCompare(String(a.publishedAt || a.date)) || b.id.localeCompare(a.id));
+      }
       function aggregateAuthor(dataset, state, author, period) {
         const allPosts = dataset.posts.filter((p) => p.authorId === author.id && p.date >= period.start && p.date < period.endExclusive);
-        const posts = allPosts.filter((p) => !state.postExclusions[p.id]);
+        const eligiblePosts = allPosts.filter((p) => countablePost(p, state).eligible);
+        const ignoredPosts = allPosts.filter((p) => !countablePost(p, state).eligible);
+        const pendingPosts = allPosts.filter((p) => postEligibility(p).eligible && relevanceEligibility(p, state).reason === "relevance-review");
+        const posts = eligiblePosts.filter((p) => !state.postExclusions[p.id]);
         const works = [...new Set(posts.map((p) => p.workId || p.id))];
         const periodDecision = state.periodDecisions[period.key + "|" + author.id];
         const ban = state.bans[author.id];
@@ -485,8 +523,8 @@ var require_model = __commonJS({
           smartFollowersComplete,
           smartEngagementComplete
         });
-        const status = ban ? "banned" : periodDecision || allPosts.length > 0 && posts.length === 0 ? "excluded" : allPosts.length === 0 ? "no-posts" : score.requiresReview ? "review" : "active";
-        return { author, allPosts, posts, works, metrics, smart, smartFollowersComplete, smartEngagementComplete, score, manual, status, participates: !manual && posts.length > 0 };
+        const status = ban ? "banned" : periodDecision || eligiblePosts.length > 0 && posts.length === 0 ? "excluded" : eligiblePosts.length === 0 ? pendingPosts.length ? "review" : "no-posts" : score.requiresReview ? "review" : "active";
+        return { author, allPosts, eligiblePosts, ignoredPosts, pendingPosts, posts, works, metrics, smart, smartFollowersComplete, smartEngagementComplete, score, manual, status, participates: !manual && posts.length > 0 };
       }
       function decision(state, payload, now) {
         const next = JSON.parse(JSON.stringify(state));
@@ -500,6 +538,11 @@ var require_model = __commonJS({
         else if (type === "restore-ban") delete next.bans[authorId];
         else if (type === "restore-period") delete next.periodDecisions[periodKey + "|" + authorId];
         else if (type === "restore-post") delete next.postExclusions[postId];
+        else if (type === "approve-relevance" || type === "reject-relevance") {
+          if (!safeId(postId) || !safeId(authorId)) throw new Error("\u041F\u043E\u0442\u0440\u0456\u0431\u043D\u0456 ID \u043F\u043E\u0441\u0442\u0430 \u0439 \u0430\u0432\u0442\u043E\u0440\u0430.");
+          next.postRelevance ||= {};
+          next.postRelevance[postId] = { ...record, authorId, action: type === "approve-relevance" ? "approve" : "reject" };
+        } else if (type === "restore-relevance") delete (next.postRelevance ||= {})[postId];
         else throw new Error("\u041D\u0435\u0432\u0456\u0434\u043E\u043C\u0438\u0439 \u0442\u0438\u043F \u0440\u0456\u0448\u0435\u043D\u043D\u044F.");
         next.audit.unshift({ id: "event:" + now + ":" + next.audit.length, type, authorId, postId: postId || null, periodKey, ...record });
         next.audit = next.audit.slice(0, 1e3);
@@ -516,33 +559,40 @@ var require_model = __commonJS({
           status: a.status,
           decision: publicDecision(a.manual),
           includedPosts: a.manual ? 0 : a.posts.length,
-          excludedPosts: a.allPosts.filter((p) => state.postExclusions[p.id]).map((p) => ({ id: p.id, url: p.url, date: p.date, ...publicDecision(state.postExclusions[p.id]) }))
+          excludedPosts: a.eligiblePosts.filter((p) => state.postExclusions[p.id]).map((p) => ({ id: p.id, url: p.url, date: p.date, ...publicDecision(state.postExclusions[p.id]) }))
         };
       }
       function initialState() {
-        return { version: 1, bans: {}, periodDecisions: {}, postExclusions: {}, accountReviews: {}, identityEvidence: {}, audit: [], snapshots: [], ui: { view: "leaderboard", period: "2026-11", sort: "impressions", status: "active", search: "" } };
+        return { version: 1, bans: {}, periodDecisions: {}, postExclusions: {}, postRelevance: {}, accountReviews: {}, identityEvidence: {}, audit: [], snapshots: [], ui: { view: "leaderboard", period: "2026-11", sort: "impressions", status: "active", search: "" } };
       }
       function validateState(raw) {
-        if (!plain2(raw) || raw.version !== 1) throw new Error("\u041D\u0435\u043F\u0456\u0434\u0442\u0440\u0438\u043C\u0443\u0432\u0430\u043D\u0430 \u0432\u0435\u0440\u0441\u0456\u044F \u0437\u0431\u0435\u0440\u0435\u0436\u0435\u043D\u043E\u0433\u043E \u0441\u0442\u0430\u043D\u0443.");
+        if (!plain3(raw) || raw.version !== 1) throw new Error("\u041D\u0435\u043F\u0456\u0434\u0442\u0440\u0438\u043C\u0443\u0432\u0430\u043D\u0430 \u0432\u0435\u0440\u0441\u0456\u044F \u0437\u0431\u0435\u0440\u0435\u0436\u0435\u043D\u043E\u0433\u043E \u0441\u0442\u0430\u043D\u0443.");
         const result = initialState();
         for (const k of ["bans", "periodDecisions", "postExclusions"]) {
-          if (!plain2(raw[k])) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0441\u043F\u0438\u0441\u043E\u043A \u0440\u0456\u0448\u0435\u043D\u044C: " + k);
+          if (!plain3(raw[k])) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0441\u043F\u0438\u0441\u043E\u043A \u0440\u0456\u0448\u0435\u043D\u044C: " + k);
           for (const [id, record] of Object.entries(raw[k])) {
-            if (!safeId(id) || !plain2(record) || typeof record.reason !== "string" || record.reason.trim().length < 3 || typeof record.at !== "string" || !Number.isFinite(Date.parse(record.at)) || record.internalNote !== void 0 && typeof record.internalNote !== "string") throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0437\u0430\u043F\u0438\u0441 \u0440\u0456\u0448\u0435\u043D\u043D\u044F.");
+            if (!safeId(id) || !plain3(record) || typeof record.reason !== "string" || record.reason.trim().length < 3 || typeof record.at !== "string" || !Number.isFinite(Date.parse(record.at)) || record.internalNote !== void 0 && typeof record.internalNote !== "string") throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0437\u0430\u043F\u0438\u0441 \u0440\u0456\u0448\u0435\u043D\u043D\u044F.");
             result[k][id] = { ...record, internalNote: record.internalNote || "" };
           }
         }
-        if (!plain2(raw.accountReviews)) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0441\u043F\u0438\u0441\u043E\u043A \u043E\u0446\u0456\u043D\u043E\u043A \u0430\u043A\u0430\u0443\u043D\u0442\u0456\u0432.");
+        if (raw.postRelevance !== void 0) {
+          if (!plain3(raw.postRelevance) || Object.keys(raw.postRelevance).length > 1e5) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0441\u043F\u0438\u0441\u043E\u043A \u043F\u0435\u0440\u0435\u0432\u0456\u0440\u043E\u043A \u0437\u0433\u0430\u0434\u043E\u043A.");
+          for (const [id, record] of Object.entries(raw.postRelevance)) {
+            if (!safeId(id) || !plain3(record) || !safeId(record.authorId) || !["approve", "reject"].includes(record.action) || typeof record.reason !== "string" || record.reason.trim().length < 3 || typeof record.at !== "string" || !Number.isFinite(Date.parse(record.at)) || record.internalNote !== void 0 && typeof record.internalNote !== "string") throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0435 \u0440\u0456\u0448\u0435\u043D\u043D\u044F \u043F\u0435\u0440\u0435\u0432\u0456\u0440\u043A\u0438 \u0437\u0433\u0430\u0434\u043A\u0438.");
+            result.postRelevance[id] = { ...record, internalNote: record.internalNote || "" };
+          }
+        }
+        if (!plain3(raw.accountReviews)) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0441\u043F\u0438\u0441\u043E\u043A \u043E\u0446\u0456\u043D\u043E\u043A \u0430\u043A\u0430\u0443\u043D\u0442\u0456\u0432.");
         for (const [id, record] of Object.entries(raw.accountReviews)) {
-          if (!safeId(id) || !plain2(record) || record.id !== id || Scoring.assessAccount(record).status === "invalid") throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0430 \u043E\u0446\u0456\u043D\u043A\u0430 \u0430\u043A\u0430\u0443\u043D\u0442\u0430.");
+          if (!safeId(id) || !plain3(record) || record.id !== id || Scoring.assessAccount(record).status === "invalid") throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0430 \u043E\u0446\u0456\u043D\u043A\u0430 \u0430\u043A\u0430\u0443\u043D\u0442\u0430.");
           result.accountReviews[id] = record;
         }
         if (raw.identityEvidence !== void 0) {
-          if (!plain2(raw.identityEvidence) || Object.keys(raw.identityEvidence).length > 2e4) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0440\u0435\u0454\u0441\u0442\u0440 \u0456\u0434\u0435\u043D\u0442\u0438\u0447\u043D\u043E\u0441\u0442\u0435\u0439.");
+          if (!plain3(raw.identityEvidence) || Object.keys(raw.identityEvidence).length > 2e4) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0440\u0435\u0454\u0441\u0442\u0440 \u0456\u0434\u0435\u043D\u0442\u0438\u0447\u043D\u043E\u0441\u0442\u0435\u0439.");
           const postOwners = /* @__PURE__ */ new Map();
           let postCount = 0;
           for (const [id, record] of Object.entries(raw.identityEvidence)) {
-            if (!safeId(id) || !plain2(record) || record.id !== id || typeof record.handle !== "string" || !record.handle.trim() || !Array.isArray(record.postIds) || record.postIds.some((postId) => !safeId(postId)) || new Set(record.postIds).size !== record.postIds.length) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0434\u043E\u043A\u0430\u0437 \u0456\u0434\u0435\u043D\u0442\u0438\u0447\u043D\u043E\u0441\u0442\u0456 \u0430\u0432\u0442\u043E\u0440\u0430.");
+            if (!safeId(id) || !plain3(record) || record.id !== id || typeof record.handle !== "string" || !record.handle.trim() || !Array.isArray(record.postIds) || record.postIds.some((postId) => !safeId(postId)) || new Set(record.postIds).size !== record.postIds.length) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0434\u043E\u043A\u0430\u0437 \u0456\u0434\u0435\u043D\u0442\u0438\u0447\u043D\u043E\u0441\u0442\u0456 \u0430\u0432\u0442\u043E\u0440\u0430.");
             postCount += record.postIds.length;
             if (postCount > 1e5) throw new Error("\u0420\u0435\u0454\u0441\u0442\u0440 \u0456\u0434\u0435\u043D\u0442\u0438\u0447\u043D\u043E\u0441\u0442\u0435\u0439 \u0437\u0430\u0432\u0435\u043B\u0438\u043A\u0438\u0439 \u0434\u043B\u044F \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u043E\u0433\u043E \u043F\u0440\u043E\u0442\u043E\u0442\u0438\u043F\u0443.");
             for (const postId of record.postIds) {
@@ -552,11 +602,11 @@ var require_model = __commonJS({
             result.identityEvidence[id] = { id, handle: record.handle, postIds: [...record.postIds] };
           }
         }
-        const eventTypes = ["ban", "exclude-period", "exclude-post", "restore-ban", "restore-period", "restore-post", "account-review"];
-        if (!Array.isArray(raw.audit) || raw.audit.length > 1e3 || raw.audit.some((e) => !plain2(e) || !eventTypes.includes(e.type) || typeof e.at !== "string" || !Number.isFinite(Date.parse(e.at)) || typeof e.reason !== "string" || e.internalNote !== void 0 && typeof e.internalNote !== "string")) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0436\u0443\u0440\u043D\u0430\u043B \u0440\u0456\u0448\u0435\u043D\u044C.");
+        const eventTypes = ["ban", "exclude-period", "exclude-post", "restore-ban", "restore-period", "restore-post", "approve-relevance", "reject-relevance", "restore-relevance", "account-review"];
+        if (!Array.isArray(raw.audit) || raw.audit.length > 1e3 || raw.audit.some((e) => !plain3(e) || !eventTypes.includes(e.type) || typeof e.at !== "string" || !Number.isFinite(Date.parse(e.at)) || typeof e.reason !== "string" || e.internalNote !== void 0 && typeof e.internalNote !== "string")) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0436\u0443\u0440\u043D\u0430\u043B \u0440\u0456\u0448\u0435\u043D\u044C.");
         result.audit = raw.audit;
         const ui = raw.ui;
-        if (!plain2(ui) || !["leaderboard", "audience", "method", "settings"].includes(ui.view) || !["impressions", "score", "likes", "replies"].includes(ui.sort) || !["active", "review", "excluded", "banned", "all"].includes(ui.status) || typeof ui.search !== "string" || !(ui.period === "sample" || /^\d{4}-(0[1-9]|1[0-2])$/.test(ui.period))) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0456 \u043D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u043D\u043D\u044F \u043F\u0435\u0440\u0435\u0433\u043B\u044F\u0434\u0443.");
+        if (!plain3(ui) || !["leaderboard", "review", "audience", "method", "settings"].includes(ui.view) || !["impressions", "score", "likes", "replies"].includes(ui.sort) || !["active", "review", "excluded", "banned", "all"].includes(ui.status) || typeof ui.search !== "string" || !(ui.period === "sample" || /^\d{4}-(0[1-9]|1[0-2])$/.test(ui.period))) throw new Error("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0456 \u043D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u043D\u043D\u044F \u043F\u0435\u0440\u0435\u0433\u043B\u044F\u0434\u0443.");
         result.ui = { ...ui };
         return result;
       }
@@ -589,7 +639,7 @@ var require_model = __commonJS({
           mappings.set(oldPost.authorId, post.authorId);
           targets.set(post.authorId, oldPost.authorId);
         }
-        const authorReferenced = (id) => Object.hasOwn(migrated.bans, id) || Object.keys(migrated.periodDecisions).some((k) => k.endsWith("|" + id)) || Object.entries(migrated.postExclusions).some(([postId, d]) => d.authorId === id || previousPosts.get(postId)?.authorId === id) || migrated.audit.some((e) => e.authorId === id || e.accountId === id) || Object.hasOwn(migrated.accountReviews, id);
+        const authorReferenced = (id) => Object.hasOwn(migrated.bans, id) || Object.keys(migrated.periodDecisions).some((k) => k.endsWith("|" + id)) || Object.entries(migrated.postExclusions).some(([postId, d]) => d.authorId === id || previousPosts.get(postId)?.authorId === id) || Object.entries(migrated.postRelevance).some(([postId, d]) => d.authorId === id || previousPosts.get(postId)?.authorId === id) || migrated.audit.some((e) => e.authorId === id || e.accountId === id) || Object.hasOwn(migrated.accountReviews, id);
         for (const [oldId, newId] of mappings) {
           if (nextAuthorIds.has(oldId)) identityError("\u0423 \u043D\u043E\u0432\u043E\u043C\u0443 \u043D\u0430\u0431\u043E\u0440\u0456 \u0437\u0430\u043B\u0438\u0448\u0438\u0432\u0441\u044F \u0456 \u0442\u0438\u043C\u0447\u0430\u0441\u043E\u0432\u0438\u0439, \u0456 \u0441\u043F\u0440\u0430\u0432\u0436\u043D\u0456\u0439 ID \u043E\u0434\u043D\u043E\u0433\u043E \u0430\u0432\u0442\u043E\u0440\u0430.");
           if (previousAuthors.has(newId) || authorReferenced(newId)) identityError("\u0426\u0456\u043B\u044C\u043E\u0432\u0438\u0439 X User ID \u0443\u0436\u0435 \u043C\u0430\u0454 \u043E\u043A\u0440\u0435\u043C\u0443 \u0456\u0441\u0442\u043E\u0440\u0456\u044E \u0430\u0431\u043E \u0440\u0456\u0448\u0435\u043D\u043D\u044F.");
@@ -636,6 +686,7 @@ var require_model = __commonJS({
           return key;
         });
         migrated.postExclusions = remapKeys(migrated.postExclusions, (id) => id, (record) => ({ ...record, ...record.authorId ? { authorId: remap(record.authorId) } : {} }));
+        migrated.postRelevance = remapKeys(migrated.postRelevance, (id) => id, (record) => ({ ...record, authorId: remap(record.authorId) }));
         migrated.accountReviews = remapKeys(migrated.accountReviews, remap, (record) => ({ ...record, id: remap(record.id) }));
         migrated.audit = migrated.audit.map((event) => ({
           ...event,
@@ -644,7 +695,7 @@ var require_model = __commonJS({
         }));
         return validateState(migrated);
       }
-      return { validateDataset, validateState, reconcileImport, periodFor, sumKnown, reviewAccounts, aggregateAuthor, decision, creatorView, initialState, safeId };
+      return { validateDataset, validateState, reconcileImport, periodFor, sumKnown, reviewAccounts, postEligibility, relevanceEligibility, countablePost, relevanceQueue, aggregateAuthor, decision, creatorView, initialState, safeId };
     });
   }
 });
@@ -652,10 +703,134 @@ var require_model = __commonJS({
 // source/entry.mjs
 var import_model3 = __toESM(require_model(), 1);
 
+// source/relevance.mjs
+var RELEVANCE_POLICY = "entropy-context-v1";
+var RELEVANCE_SIGNALS = Object.freeze([
+  "direct_mention",
+  "official_domain",
+  "official_post_link",
+  "official_quote",
+  "brand_name",
+  "hyperliquid_context",
+  "hip3_context",
+  "product_context",
+  "generic_trading_context",
+  "community_context",
+  "science_context",
+  "other_project_context"
+]);
+var RELEVANCE_REASON_CODES = Object.freeze([
+  "DIRECT_MENTION",
+  "OFFICIAL_DOMAIN",
+  "OFFICIAL_POST_LINK",
+  "OFFICIAL_QUOTE",
+  "PROJECT_CONTEXT",
+  "AMBIGUOUS_ENTROPY",
+  "CONFLICTING_CONTEXT",
+  "UNRELATED_SCIENCE",
+  "OTHER_PROJECT",
+  "NO_PROJECT_EVIDENCE"
+]);
+var plain = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+var array = (value) => Array.isArray(value) ? value : [];
+var text = (value) => typeof value === "string" ? value : "";
+var numericId = (value) => typeof value === "string" && /^[1-9]\d{0,24}$/.test(value);
+var exactHandle = (value) => typeof value === "string" && value.toLowerCase() === "entropyio";
+var brand = /(^|[^\p{L}\p{N}_])entropy(?:io)?(?=$|[^\p{L}\p{N}_])/iu;
+var mention = /(^|[^A-Za-z0-9_])@entropyIO(?![A-Za-z0-9_])/i;
+var urlsInText = /https?:\/\/[^\s<>"']+/giu;
+var product = /\b(?:markets?|trad(?:e|es|ing)|perps?|perpetuals?|pre[\s-]?ipo|private\s+(?:equities|equity|markets?|assets?|companies)|equities|order[\s-]?books?)\b/i;
+var genericTrading = /\b(?:crypto|defi|trading|trade|trader|perps?|perpetuals?|tokens?|airdrop|funding|staking|leverage|markets?)\b/i;
+var community = /\b(?:creators?|community|discord|voices|council|genesis|contributors?|ambassadors?)\b/i;
+var scientific = /\b(?:thermodynamics?|thermochemistr(?:y|ical)|shannon|boltzmann|gibbs|physics|electromagnet(?:ic|ism)|information\s+theory|cross[\s-]?entropy|entropy\s+loss|randomness|random\s+(?:numbers?|bits?|seeds?)|rng|heat\s+death|black\s+holes?|dry\s+reforming|synthesis\s+gas|syngas|(?:ni|nickel)\s+catalysts?|applied\s+catalysis|metallurg(?:y|ical)|high[\s-]?entropy\s+alloys?)\b/i;
+var otherDomains = ["entropy.xyz", "entropynetwork.io", "entropy.international"];
+function url(value) {
+  if (typeof value !== "string" || value.length > 4096) return null;
+  try {
+    const result = new URL(value.replace(/[),.;!?\]}]+$/u, ""));
+    if (result.protocol !== "https:" || result.username || result.password || result.port) return null;
+    return result;
+  } catch {
+    return null;
+  }
+}
+function host(value) {
+  return value.hostname.toLowerCase().replace(/\.$/, "");
+}
+var under = (hostname, domain) => hostname === domain || hostname.endsWith("." + domain);
+function ownUrls(tweet) {
+  const values = array(tweet.entities?.urls).map((value) => plain(value) ? value.expanded_url : null);
+  values.push(...text(tweet.text).match(urlsInText) || []);
+  return values.map(url).filter(Boolean);
+}
+function resultFor(signals) {
+  const values = RELEVANCE_SIGNALS.filter((value) => signals.has(value));
+  const anchors = [
+    ["direct_mention", "DIRECT_MENTION"],
+    ["official_domain", "OFFICIAL_DOMAIN"],
+    ["official_post_link", "OFFICIAL_POST_LINK"],
+    ["official_quote", "OFFICIAL_QUOTE"]
+  ].filter(([signal]) => signals.has(signal)).map(([, code]) => code);
+  const specificProject = signals.has("brand_name") && signals.has("product_context") && (signals.has("hyperliquid_context") || signals.has("hip3_context"));
+  let status, reasonCodes;
+  if (anchors.length) {
+    status = "accepted";
+    reasonCodes = anchors;
+  } else if (specificProject && signals.has("other_project_context")) {
+    status = "review";
+    reasonCodes = ["CONFLICTING_CONTEXT"];
+  } else if (specificProject) {
+    status = "accepted";
+    reasonCodes = ["PROJECT_CONTEXT"];
+  } else if (signals.has("other_project_context")) {
+    status = "rejected";
+    reasonCodes = ["OTHER_PROJECT"];
+  } else if (signals.has("brand_name") && signals.has("science_context") && !signals.has("generic_trading_context") && !signals.has("community_context")) {
+    status = "rejected";
+    reasonCodes = ["UNRELATED_SCIENCE"];
+  } else if (signals.has("brand_name")) {
+    status = "review";
+    reasonCodes = ["AMBIGUOUS_ENTROPY"];
+  } else {
+    status = "rejected";
+    reasonCodes = ["NO_PROJECT_EVIDENCE"];
+  }
+  return { version: RELEVANCE_POLICY, status, reasonCodes, signals: values };
+}
+function classifyTweet(raw) {
+  const tweet = plain(raw) ? raw : {}, ownText = text(tweet.text), signals = /* @__PURE__ */ new Set();
+  const prose = ownText.replace(urlsInText, " ");
+  if (mention.test(prose) || array(tweet.entities?.user_mentions).some((value) => plain(value) && exactHandle(value.screen_name))) signals.add("direct_mention");
+  for (const destination of ownUrls(tweet)) {
+    const hostname = host(destination);
+    if (under(hostname, "entropy.io")) signals.add("official_domain");
+    if (["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(hostname) && /^\/entropyio\/status\/[1-9]\d{0,24}(?:\/(?:photo|video)\/\d+)?\/?$/i.test(destination.pathname)) signals.add("official_post_link");
+    if (otherDomains.some((domain) => under(hostname, domain)) || under(hostname, "pyth.network") && /^\/entropy(?:\/|$)/i.test(destination.pathname)) signals.add("other_project_context");
+    if (hostname === "discord.gg" && /^\/entropyio\/?$/i.test(destination.pathname)) signals.add("community_context");
+  }
+  const quote = plain(tweet.quoted_tweet) ? tweet.quoted_tweet : null;
+  if (quote && numericId(quote.id) && plain(quote.author) && exactHandle(quote.author.userName)) signals.add("official_quote");
+  if (brand.test(ownText)) signals.add("brand_name");
+  if (/\bhyperliquid\b/i.test(prose)) signals.add("hyperliquid_context");
+  if (/\bhip[\s-]?3\b/i.test(prose)) signals.add("hip3_context");
+  if (product.test(prose)) signals.add("product_context");
+  if (genericTrading.test(prose)) signals.add("generic_trading_context");
+  if (community.test(prose)) signals.add("community_context");
+  if (scientific.test(prose)) signals.add("science_context");
+  if (/\bpyth\s+entropy\b/i.test(prose) || /(^|[^A-Za-z0-9_])@entropydotxyz(?![A-Za-z0-9_])/i.test(prose) || array(tweet.entities?.user_mentions).some((value) => plain(value) && typeof value.screen_name === "string" && value.screen_name.toLowerCase() === "entropydotxyz")) signals.add("other_project_context");
+  return resultFor(signals);
+}
+function validatedRelevance(value) {
+  if (!plain(value) || value.version !== RELEVANCE_POLICY || !["accepted", "review", "rejected"].includes(value.status) || !Array.isArray(value.reasonCodes) || !value.reasonCodes.length || value.reasonCodes.length > 4 || !Array.isArray(value.signals) || value.signals.length > RELEVANCE_SIGNALS.length || value.reasonCodes.some((code) => !RELEVANCE_REASON_CODES.includes(code)) || value.signals.some((signal) => !RELEVANCE_SIGNALS.includes(signal)) || new Set(value.reasonCodes).size !== value.reasonCodes.length || new Set(value.signals).size !== value.signals.length) return null;
+  const result = resultFor(new Set(value.signals));
+  if (result.status !== value.status || result.reasonCodes.length !== value.reasonCodes.length || result.reasonCodes.some((code) => !value.reasonCodes.includes(code))) return null;
+  return result;
+}
+
 // source/twitterapi.mjs
 var ORIGIN = "https://api.twitterapi.io";
-var numericId = (value) => typeof value === "string" && /^[1-9]\d*$/.test(value);
-var plain = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+var numericId2 = (value) => typeof value === "string" && /^[1-9]\d*$/.test(value);
+var plain2 = (value) => !!value && typeof value === "object" && !Array.isArray(value);
 var TwitterApiError = class extends Error {
   constructor(code, message, status = null) {
     super(message);
@@ -673,15 +848,15 @@ function responseError(message) {
 function createClient({ apiKey, fetchImpl, timeoutMs = 3e4 } = {}) {
   if (typeof apiKey !== "string" || !apiKey.trim() || /[\r\n]/.test(apiKey)) invalid("\u041F\u043E\u0442\u0440\u0456\u0431\u0435\u043D \u0441\u0435\u0440\u0432\u0435\u0440\u043D\u0438\u0439 \u043A\u043B\u044E\u0447 twitterapi.io.");
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 65e3) invalid("\u0422\u0430\u0439\u043C\u0430\u0443\u0442 \u0437\u0430\u043F\u0438\u0442\u0443 \u043C\u0430\u0454 \u0431\u0443\u0442\u0438 \u0432\u0456\u0434 1 \u0434\u043E 65000 \u043C\u0441.");
-  const request = fetchImpl === void 0 ? (url, init) => globalThis.fetch(url, init) : fetchImpl;
+  const request = fetchImpl === void 0 ? (url2, init) => globalThis.fetch(url2, init) : fetchImpl;
   if (typeof request !== "function") invalid("\u041D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0438\u0439 HTTP-\u043A\u043B\u0456\u0454\u043D\u0442.");
   const secret = apiKey.trim();
   async function get(route, params) {
-    const url = new URL(route, ORIGIN);
-    for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    const url2 = new URL(route, ORIGIN);
+    for (const [key, value] of Object.entries(params)) url2.searchParams.set(key, value);
     let response;
     try {
-      response = await request(url, {
+      response = await request(url2, {
         method: "GET",
         headers: { "x-api-key": secret, Accept: "application/json" },
         // Workers supports manual/follow only. Manual also keeps the key from
@@ -707,7 +882,7 @@ function createClient({ apiKey, fetchImpl, timeoutMs = 3e4 } = {}) {
       if (["TimeoutError", "AbortError"].includes(error?.name)) throw new TwitterApiError("REQUEST_TIMEOUT", "\u0417\u0430\u043F\u0438\u0442 twitterapi.io \u043D\u0435 \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u0432\u0441\u044F. \u0414\u0430\u043D\u0456 \u043D\u0435 \u043E\u043D\u043E\u0432\u043B\u0435\u043D\u043E.");
       responseError("twitterapi.io \u043F\u043E\u0432\u0435\u0440\u043D\u0443\u0432 \u043D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 JSON.");
     }
-    if (!plain(body)) responseError("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0444\u043E\u0440\u043C\u0430\u0442 \u0432\u0456\u0434\u043F\u043E\u0432\u0456\u0434\u0456 twitterapi.io.");
+    if (!plain2(body)) responseError("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0444\u043E\u0440\u043C\u0430\u0442 \u0432\u0456\u0434\u043F\u043E\u0432\u0456\u0434\u0456 twitterapi.io.");
     if (body.status === "error" || body.error || body.status && body.status !== "success") {
       throw new TwitterApiError("PROVIDER_ERROR", "twitterapi.io \u043F\u043E\u0432\u0456\u0434\u043E\u043C\u0438\u0432 \u043F\u0440\u043E \u043F\u043E\u043C\u0438\u043B\u043A\u0443. \u0414\u0430\u043D\u0456 \u043D\u0435 \u043E\u043D\u043E\u0432\u043B\u0435\u043D\u043E.");
     }
@@ -733,17 +908,17 @@ function createClient({ apiKey, fetchImpl, timeoutMs = 3e4 } = {}) {
       return { tweets: body.tweets, hasNextPage: body.has_next_page, nextCursor: body.has_next_page ? body.next_cursor : null };
     },
     async tweetsByIds(ids) {
-      if (!Array.isArray(ids) || ids.length < 1 || ids.length > 50 || ids.some((id) => !numericId(id))) invalid("\u041F\u043E\u0442\u0440\u0456\u0431\u043D\u0456 1\u201350 \u0442\u043E\u0447\u043D\u0438\u0445 \u0442\u0435\u043A\u0441\u0442\u043E\u0432\u0438\u0445 X Post ID.");
+      if (!Array.isArray(ids) || ids.length < 1 || ids.length > 50 || ids.some((id) => !numericId2(id))) invalid("\u041F\u043E\u0442\u0440\u0456\u0431\u043D\u0456 1\u201350 \u0442\u043E\u0447\u043D\u0438\u0445 \u0442\u0435\u043A\u0441\u0442\u043E\u0432\u0438\u0445 X Post ID.");
       const wanted = [...new Set(ids)];
       const body = await get("/twitter/tweets", { tweet_ids: wanted.join(",") });
       const seen = /* @__PURE__ */ new Set(), tweets = [];
       let unavailableEntries = 0;
       for (const tweet of body.tweets) {
-        if (plain(tweet) && (tweet.id === "" || tweet.id === null)) {
+        if (plain2(tweet) && (tweet.id === "" || tweet.id === null)) {
           unavailableEntries++;
           continue;
         }
-        if (!plain(tweet) || !numericId(tweet.id) || !wanted.includes(tweet.id) || seen.has(tweet.id)) responseError("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0430\u0431\u043E \u043F\u043E\u0432\u0442\u043E\u0440\u043D\u0438\u0439 ID \u0443 \u0432\u0456\u0434\u043F\u043E\u0432\u0456\u0434\u0456 twitterapi.io.");
+        if (!plain2(tweet) || !numericId2(tweet.id) || !wanted.includes(tweet.id) || seen.has(tweet.id)) responseError("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0430\u0431\u043E \u043F\u043E\u0432\u0442\u043E\u0440\u043D\u0438\u0439 ID \u0443 \u0432\u0456\u0434\u043F\u043E\u0432\u0456\u0434\u0456 twitterapi.io.");
         seen.add(tweet.id);
         tweets.push(tweet);
       }
@@ -772,7 +947,7 @@ function instant(value, label) {
   return new Date(timestamp2).toISOString();
 }
 function isRepost(tweet) {
-  return tweet.isRetweet === true || plain(tweet.retweeted_tweet) || typeof tweet.retweeted_tweet === "string" && tweet.retweeted_tweet.length > 0;
+  return tweet.isRetweet === true || plain2(tweet.retweeted_tweet) || typeof tweet.retweeted_tweet === "string" && tweet.retweeted_tweet.length > 0;
 }
 function normalizeTweets(tweets, { observedAt, query = "", periodStart, periodEndExclusive } = {}) {
   if (!Array.isArray(tweets) || tweets.length > 1e5) invalid("\u041F\u043E\u0442\u0440\u0456\u0431\u0435\u043D \u043E\u0431\u043C\u0435\u0436\u0435\u043D\u0438\u0439 \u0441\u043F\u0438\u0441\u043E\u043A tweets.");
@@ -788,14 +963,14 @@ function normalizeTweets(tweets, { observedAt, query = "", periodStart, periodEn
   const diagnostics = { inputRows: tweets.length, excludedReposts: 0, duplicates: 0, outsidePeriod: 0 };
   for (let index = 0; index < tweets.length; index++) {
     const tweet = tweets[index];
-    if (!plain(tweet)) invalid("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0437\u0430\u043F\u0438\u0441 tweets \u0437\u0430 \u0456\u043D\u0434\u0435\u043A\u0441\u043E\u043C " + index + ".");
+    if (!plain2(tweet)) invalid("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0437\u0430\u043F\u0438\u0441 tweets \u0437\u0430 \u0456\u043D\u0434\u0435\u043A\u0441\u043E\u043C " + index + ".");
     if (isRepost(tweet)) {
       diagnostics.excludedReposts++;
       continue;
     }
-    if (!numericId(tweet.id)) invalid("\u0423 tweets \u0437\u0430 \u0456\u043D\u0434\u0435\u043A\u0441\u043E\u043C " + index + " \u043F\u043E\u0442\u0440\u0456\u0431\u0435\u043D \u0442\u043E\u0447\u043D\u0438\u0439 \u0442\u0435\u043A\u0441\u0442\u043E\u0432\u0438\u0439 ID.");
+    if (!numericId2(tweet.id)) invalid("\u0423 tweets \u0437\u0430 \u0456\u043D\u0434\u0435\u043A\u0441\u043E\u043C " + index + " \u043F\u043E\u0442\u0440\u0456\u0431\u0435\u043D \u0442\u043E\u0447\u043D\u0438\u0439 \u0442\u0435\u043A\u0441\u0442\u043E\u0432\u0438\u0439 ID.");
     const author = tweet.author;
-    if (!plain(author) || !numericId(author.id) || typeof author.userName !== "string" || !/^[A-Za-z0-9_]{1,15}$/.test(author.userName)) invalid("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0430\u0432\u0442\u043E\u0440 \u0443 tweets \u0437\u0430 \u0456\u043D\u0434\u0435\u043A\u0441\u043E\u043C " + index + ".");
+    if (!plain2(author) || !numericId2(author.id) || typeof author.userName !== "string" || !/^[A-Za-z0-9_]{1,15}$/.test(author.userName)) invalid("\u041D\u0435\u043A\u043E\u0440\u0435\u043A\u0442\u043D\u0438\u0439 \u0430\u0432\u0442\u043E\u0440 \u0443 tweets \u0437\u0430 \u0456\u043D\u0434\u0435\u043A\u0441\u043E\u043C " + index + ".");
     const publishedAt = instant(tweet.createdAt, "\u043F\u0443\u0431\u043B\u0456\u043A\u0430\u0446\u0456\u0457");
     const date = publishedAt.slice(0, 10);
     if (periodStart !== void 0 && (date < periodStart || date >= periodEndExclusive)) {
@@ -842,10 +1017,11 @@ function normalizeTweets(tweets, { observedAt, query = "", periodStart, periodEn
       metricsWindow: "cumulative",
       source: "twitterapi.io",
       // conversationId is retained as evidence, never used to group other authors' work.
-      conversationId: numericId(tweet.conversationId) ? tweet.conversationId : null,
-      inReplyToId: numericId(tweet.inReplyToId) ? tweet.inReplyToId : null,
-      isReply: tweet.isReply === true,
-      isQuote: !!tweet.quoted_tweet
+      conversationId: numericId2(tweet.conversationId) ? tweet.conversationId : null,
+      inReplyToId: numericId2(tweet.inReplyToId) ? tweet.inReplyToId : null,
+      isReply: typeof tweet.isReply === "boolean" ? tweet.isReply : null,
+      isQuote: !!tweet.quoted_tweet,
+      relevance: classifyTweet(tweet)
     });
   }
   const dates = [...posts.values()].map((post) => post.date).sort();
@@ -883,9 +1059,27 @@ var DAY = 864e5;
 var INTERVAL = 3e5;
 var METRICS = ["impressions", "likes", "reposts", "uiReposts", "quotes", "replies", "bookmarks"];
 var copy = (value) => JSON.parse(JSON.stringify(value));
-var numericId2 = (value) => typeof value === "string" && /^[1-9]\d*$/.test(value);
+var numericId3 = (value) => typeof value === "string" && /^[1-9]\d*$/.test(value);
 var known = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
 var timestamp = (value) => typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : null;
+var DISCOVERY_QUERY_POLICY = "entropy-context-v1";
+var DISCOVERY_LANES = Object.freeze(["direct", "evidence", "context"]);
+function discoveryTerms(lane = "direct", policy = DISCOVERY_QUERY_POLICY) {
+  if (!DISCOVERY_LANES.includes(lane)) throw new Error("Invalid discovery lane.");
+  if (policy !== DISCOVERY_QUERY_POLICY || lane === "direct") return "@" + TARGET;
+  return lane === "evidence" ? '(url:entropy.io OR "entropy.io" OR url:x.com/entropyIO OR url:twitter.com/entropyIO)' : "Entropy";
+}
+function discoveryQuery(start, endExclusive, policy = DISCOVERY_QUERY_POLICY, lane = "direct") {
+  const filters = [DISCOVERY_QUERY_POLICY, "original-tweets-v1"].includes(policy) ? " -filter:replies -filter:nativeretweets" : "";
+  return discoveryTerms(lane, policy) + filters + " since_time:" + Math.floor(Date.parse(start) / 1e3) + " until_time:" + Math.floor(Date.parse(endExclusive) / 1e3);
+}
+function mergedRelevance(previous, incoming, body) {
+  const before = validatedRelevance(previous), after = validatedRelevance(incoming);
+  if (before?.status === "accepted" && after?.status !== "accepted") return before;
+  if (before?.status === "review" && (!after || after.status === "rejected")) return before;
+  if ((!body || !body.trim()) && after?.status === "rejected") return before;
+  return after || before;
+}
 function mergeDefined(oldValue, newValue) {
   const result = { ...oldValue || {} };
   for (const [key, value] of Object.entries(newValue || {})) if (value !== null && value !== void 0) result[key] = value;
@@ -922,6 +1116,12 @@ function mergePost(previous, incoming, oldAsOf, newAsOf) {
   return {
     ...mergeDefined(previous, incoming),
     authorId: incoming.authorId,
+    relevance: mergedRelevance(previous.relevance, incoming.relevance, incoming.body),
+    discoveryLanes: [.../* @__PURE__ */ new Set([...previous.discoveryLanes || [], ...incoming.discoveryLanes || []])].filter((lane) => DISCOVERY_LANES.includes(lane)),
+    // A partial provider observation cannot erase positive reply evidence.
+    isReply: previous.isReply === true || incoming.isReply === true ? true : incoming.isReply ?? previous.isReply ?? null,
+    inReplyToId: previous.inReplyToId || incoming.inReplyToId || null,
+    isRepost: import_model.default.postEligibility({ ...previous, isReply: false, inReplyToId: null }).reason === "repost" || import_model.default.postEligibility({ ...incoming, isReply: false, inReplyToId: null }).reason === "repost" ? true : incoming.isRepost ?? previous.isRepost ?? null,
     workId: previous.workId || incoming.workId || null,
     metrics,
     metricsObservedAt,
@@ -940,7 +1140,7 @@ function mergeDataset(previousRaw, incomingRaw) {
   for (const post of incoming.posts) {
     const old = oldPosts.get(post.id);
     if (!old || old.authorId === post.authorId) continue;
-    if (!old.authorId.startsWith("sample:") || !numericId2(post.authorId)) throw new Error("Post ownership conflict.");
+    if (!old.authorId.startsWith("sample:") || !numericId3(post.authorId)) throw new Error("Post ownership conflict.");
     if (aliases.has(old.authorId) && aliases.get(old.authorId) !== post.authorId) throw new Error("Ambiguous sample identity.");
     if (targets.has(post.authorId) && targets.get(post.authorId) !== old.authorId) throw new Error("Merged sample identities.");
     if (previous.authors.some((a) => a.id === post.authorId)) throw new Error("Target identity already exists.");
@@ -1032,7 +1232,7 @@ function initialSync(raw, nowMs) {
   sync.discovery.recentThrough = timestamp(sync.discovery.recentThrough);
   sync.discovery.nextLane = ["recent", "backfill"].includes(sync.discovery.nextLane) ? sync.discovery.nextLane : sync.discovery.pendingWindows[0]?.cursor ? "backfill" : "recent";
   sync.refresh ||= { pendingIds: [], cycleStartedAt: null };
-  sync.refresh.pendingIds = Array.isArray(sync.refresh.pendingIds) ? sync.refresh.pendingIds.filter(numericId2) : [];
+  sync.refresh.pendingIds = Array.isArray(sync.refresh.pendingIds) ? sync.refresh.pendingIds.filter(numericId3) : [];
   sync.lastAttemptAt ||= null;
   sync.lastSuccessAt ||= null;
   sync.lastDataAt ||= null;
@@ -1076,17 +1276,34 @@ function prepareDiscovery(sync, nowMs, nowIso) {
 function directlyMentioned(tweet) {
   return /(^|[^A-Za-z0-9_])@entropyIO(?![A-Za-z0-9_])/i.test(typeof tweet.text === "string" ? tweet.text : "") || Array.isArray(tweet.entities?.user_mentions) && tweet.entities.user_mentions.some((m) => typeof m?.screen_name === "string" && m.screen_name.toLowerCase() === TARGET.toLowerCase());
 }
+function formatEligible(post) {
+  return !["reply", "repost"].includes(import_model.default.postEligibility(post).reason);
+}
+function matchesDiscoveryLane(post, lane = "direct") {
+  if (!DISCOVERY_LANES.includes(lane)) return false;
+  if (Array.isArray(post.discoveryLanes) && post.discoveryLanes.includes(lane)) return true;
+  if (lane === "direct") return directlyMentioned({ text: post.body }) || validatedRelevance(post.relevance)?.signals.includes("direct_mention") === true;
+  const relevance = validatedRelevance(post.relevance);
+  if (lane === "evidence") return relevance?.signals.some((value) => ["official_domain", "official_post_link"].includes(value)) === true;
+  return /\bentropy\b/i.test(post.body || "");
+}
 function normalizedPage(tweets, nowIso, window2 = null) {
-  const data = normalizeTweets(tweets, { observedAt: nowIso, query: "@" + TARGET });
+  const data = normalizeTweets(tweets, { observedAt: nowIso, query: window2?.query || "@" + TARGET });
   if (window2) {
-    const mentionIds = new Set(tweets.filter(directlyMentioned).map((t) => t.id));
     const from = Date.parse(window2.start), until = Date.parse(window2.endExclusive);
-    data.posts = data.posts.filter((p) => mentionIds.has(p.id) && p.authorHandle.toLowerCase() !== TARGET.toLowerCase() && Date.parse(p.publishedAt) >= from && Date.parse(p.publishedAt) < until);
+    data.posts = data.posts.filter((p) => formatEligible(p) && ["accepted", "review"].includes(p.relevance?.status) && p.authorHandle.toLowerCase() !== TARGET.toLowerCase() && Date.parse(p.publishedAt) >= from && Date.parse(p.publishedAt) < until).map((post) => ({ ...post, discoveryLanes: [window2.discoveryLane || "direct"] }));
     const authors = new Set(data.posts.map((p) => p.authorId));
     data.authors = data.authors.filter((a) => authors.has(a.id));
     data.meta.periodStart = window2.start.slice(0, 10);
     data.meta.periodEndExclusive = new Date(Math.ceil(until / DAY) * DAY).toISOString().slice(0, 10);
   }
+  return data;
+}
+function normalizeDiscoveryPage(tweets, observedAt, window2 = null) {
+  const data = normalizedPage(tweets, observedAt, window2);
+  data.posts = data.posts.filter((post) => formatEligible(post) && ["accepted", "review"].includes(post.relevance?.status) && post.authorHandle.toLowerCase() !== TARGET.toLowerCase());
+  const authors = new Set(data.posts.map((post) => post.authorId));
+  data.authors = data.authors.filter((author) => authors.has(author.id));
   return data;
 }
 function classifySyncError(error) {
@@ -1157,7 +1374,9 @@ async function advanceSync(workbench, { client, now, maxRequests = 1 } = {}) {
   if (Date.parse(sync.nextRunAt) > nowMs) return result();
   if (!client || typeof client.searchPage !== "function" || typeof client.tweetsByIds !== "function") throw new Error("A read-only provider client is required.");
   const discoveryLane = prepareDiscovery(sync, nowMs, nowIso);
-  const eligible = dataset.posts.filter((p) => numericId2(p.id));
+  const eligible = dataset.posts.filter((p) => numericId3(p.id) && (import_model.default.countablePost ? import_model.default.countablePost(p, state).eligible : import_model.default.postEligibility(p).eligible && p.relevance?.status !== "review"));
+  const eligibleIds = new Set(eligible.map((p) => p.id));
+  sync.refresh.pendingIds = sync.refresh.pendingIds.filter((id) => eligibleIds.has(id));
   if (sync.requestCount === 0 && eligible.some((p) => p.authorId.startsWith("sample:"))) sync.phase = "refresh";
   if (sync.phase === "refresh" && !sync.refresh.pendingIds.length) {
     sync.refresh.pendingIds = [...eligible].sort((a, b) => (Date.parse(a.lastCheckedAt || a.metricsAsOf) || 0) - (Date.parse(b.lastCheckedAt || b.metricsAsOf) || 0)).map((p) => p.id);
@@ -1254,12 +1473,16 @@ async function advanceSync(workbench, { client, now, maxRequests = 1 } = {}) {
 var HOUR = 36e5;
 var CATCHUP_SPACING = 5100;
 var HOURLY_MIN_WINDOW = 3e5;
-function hourlyWindow(start, endExclusive, kind = "latest", method = "mentions") {
+function hourlyWindow(start, endExclusive, kind = "latest", method = "search", discoveryLane = "direct") {
+  const from = new Date(start).toISOString(), until = new Date(endExclusive).toISOString();
   return {
-    id: "hourly:" + method + ":" + new Date(start).toISOString() + ":" + new Date(endExclusive).toISOString(),
+    id: "hourly:" + DISCOVERY_QUERY_POLICY + ":" + discoveryLane + ":" + method + ":" + from + ":" + until,
     method,
-    start: new Date(start).toISOString(),
-    endExclusive: new Date(endExclusive).toISOString(),
+    discoveryLane,
+    queryPolicy: DISCOVERY_QUERY_POLICY,
+    query: discoveryQuery(from, until, DISCOVERY_QUERY_POLICY, discoveryLane),
+    start: from,
+    endExclusive: until,
     kind,
     cursor: "",
     previousOldest: null,
@@ -1267,131 +1490,237 @@ function hourlyWindow(start, endExclusive, kind = "latest", method = "mentions")
     observedPostIds: []
   };
 }
-function hourlyCheckpoint(sync) {
+function emptyLane() {
+  return { latestPlannedThrough: null, completedRanges: [], completedThrough: null, coverageFrom: null, lastAuditDay: null };
+}
+function laneState(hourly, lane = "direct") {
+  return hourly.lanes[lane];
+}
+function mirrorDirect(hourly) {
+  const direct = laneState(hourly);
+  for (const key of ["latestPlannedThrough", "completedRanges", "completedThrough", "coverageFrom", "lastAuditDay", "lastAuditAt", "lastAuditRange"]) hourly[key] = direct[key] ?? null;
+}
+function hourlyCheckpoint(sync, at) {
   const hourly = copy(sync.hourly || {});
-  hourly.version = 1;
+  const changed = hourly.queryPolicy !== DISCOVERY_QUERY_POLICY;
+  hourly.version = 3;
   hourly.target = TARGET;
-  hourly.method = "mentions";
+  hourly.method = "search";
   hourly.pendingWindows = Array.isArray(hourly.pendingWindows) ? hourly.pendingWindows : [];
   hourly.completedRanges = Array.isArray(hourly.completedRanges) ? hourly.completedRanges : [];
   hourly.gaps = Array.isArray(hourly.gaps) ? hourly.gaps : [];
+  if (changed) {
+    const previous = hourly.pendingWindows;
+    hourly.policyHistory = [...hourly.policyHistory || [], {
+      at,
+      queryPolicy: hourly.queryPolicy || "legacy-unfiltered",
+      completedThrough: hourly.completedThrough || null,
+      completedRangeCount: hourly.completedRanges.length,
+      pendingWindows: previous.map((value) => ({
+        start: value.start,
+        endExclusive: value.endExclusive,
+        discoveryLane: value.discoveryLane || "direct",
+        method: value.method || "mentions",
+        hadCursor: !!value.cursor
+      }))
+    }].slice(-3);
+    hourly.pendingWindows = previous.map((value) => ({ ...hourlyWindow(Date.parse(value.start), Date.parse(value.endExclusive), value.kind || "policy-recovery"), audit: value.audit === true || value.kind === "audit" }));
+    hourly.lanes = Object.fromEntries(DISCOVERY_LANES.map((lane) => [lane, emptyLane()]));
+    hourly.lanes.direct.latestPlannedThrough = timestamp(hourly.latestPlannedThrough);
+    hourly.catchupLaneIndex = 0;
+  } else {
+    hourly.lanes ||= {};
+    for (const lane of DISCOVERY_LANES) {
+      if (!hourly.lanes[lane]) hourly.lanes[lane] = lane === "direct" ? {
+        ...emptyLane(),
+        latestPlannedThrough: hourly.latestPlannedThrough,
+        completedRanges: hourly.completedRanges,
+        completedThrough: hourly.completedThrough,
+        coverageFrom: hourly.coverageFrom,
+        lastAuditDay: hourly.lastAuditDay,
+        lastAuditAt: hourly.lastAuditAt,
+        lastAuditRange: hourly.lastAuditRange
+      } : emptyLane();
+    }
+    hourly.pendingWindows = hourly.pendingWindows.map((value) => ({ ...value, discoveryLane: value.discoveryLane || "direct" }));
+  }
+  for (const lane of DISCOVERY_LANES) {
+    const value = laneState(hourly, lane);
+    value.completedRanges = Array.isArray(value.completedRanges) ? value.completedRanges : [];
+    for (const key of ["latestPlannedThrough", "completedThrough", "coverageFrom", "lastAttemptAt", "lastSuccessAt", "lastDataAt"]) value[key] = timestamp(value[key]);
+    for (const window2 of hourly.pendingWindows.filter((window3) => window3.discoveryLane === lane)) if (!value.coverageFrom || Date.parse(window2.start) < Date.parse(value.coverageFrom)) value.coverageFrom = window2.start;
+  }
+  hourly.queryPolicy = DISCOVERY_QUERY_POLICY;
   for (const key of ["requestCount", "searchPages", "latestPages", "catchupPages", "addedPosts", "splitWindows"]) hourly[key] = Number.isInteger(hourly[key]) && hourly[key] >= 0 ? hourly[key] : 0;
   hourly.catchupRequestCount = Number.isInteger(hourly.catchupRequestCount) && hourly.catchupRequestCount >= 0 ? hourly.catchupRequestCount : hourly.catchupPages;
-  for (const key of ["lastAttemptAt", "lastSuccessAt", "lastDataAt", "latestPlannedThrough", "completedThrough", "coverageFrom", "nextRunAt", "nextAttemptAt", "catchupLastAttemptAt", "catchupLastSuccessAt"]) hourly[key] = timestamp(hourly[key]);
+  for (const key of ["lastAttemptAt", "lastSuccessAt", "lastDataAt", "nextRunAt", "nextAttemptAt", "catchupLastAttemptAt", "catchupLastSuccessAt"]) hourly[key] = timestamp(hourly[key]);
   hourly.lastError ||= null;
   hourly.catchupLastError ||= null;
   hourly.catchupNextAttemptAt = hourly.nextAttemptAt;
+  mirrorDirect(hourly);
   sync.hourly = hourly;
   return hourly;
 }
 function appendHourlyWindow(hourly, value) {
-  if (!hourly.pendingWindows.some((window2) => window2.id === value.id || (window2.method || "mentions") === value.method && window2.start === value.start && window2.endExclusive === value.endExclusive)) hourly.pendingWindows.push(value);
-  if (!hourly.coverageFrom || Date.parse(value.start) < Date.parse(hourly.coverageFrom)) hourly.coverageFrom = value.start;
+  if (!hourly.pendingWindows.some((window2) => window2.id === value.id || window2.queryPolicy === value.queryPolicy && window2.discoveryLane === value.discoveryLane && window2.method === value.method && window2.start === value.start && window2.endExclusive === value.endExclusive)) hourly.pendingWindows.push(value);
+  const state = laneState(hourly, value.discoveryLane);
+  if (!state.coverageFrom || Date.parse(value.start) < Date.parse(state.coverageFrom)) state.coverageFrom = value.start;
 }
 function migrateHourlyRecent(sync, hourly) {
   if (hourly.migratedLegacyRecent) return;
   const old = sync.discovery.recentWindow;
-  if (old && timestamp(old.start) && timestamp(old.endExclusive) && Date.parse(old.start) < Date.parse(old.endExclusive)) {
-    const value = { ...copy(old), ...hourlyWindow(Date.parse(old.start), Date.parse(old.endExclusive), "legacy-recent", "search"), cursor: old.cursor || "", previousOldest: old.previousOldest ?? null, seenCursors: copy(old.seenCursors || []), observedPostIds: copy(old.observedPostIds || []) };
-    value.kind = "legacy-recent";
-    value.observedPostIds ||= [];
-    appendHourlyWindow(hourly, value);
-  }
+  if (old && timestamp(old.start) && timestamp(old.endExclusive) && Date.parse(old.start) < Date.parse(old.endExclusive)) appendHourlyWindow(hourly, hourlyWindow(Date.parse(old.start), Date.parse(old.endExclusive), "legacy-recent"));
   hourly.migratedLegacyRecent = true;
+}
+function prepareHourlyAudit(hourly, nowMs) {
+  const day2 = new Date(nowMs).toISOString().slice(0, 10);
+  for (const lane of DISCOVERY_LANES) {
+    const state = laneState(hourly, lane);
+    if (state.lastAuditDay === day2 || hourly.pendingWindows.some((value) => value.discoveryLane === lane && (value.kind === "audit" || value.audit === true))) continue;
+    const until = Math.floor(nowMs / 1e3) * 1e3 - HOUR, from = until - 71 * HOUR;
+    for (let point = from; point < until; ) {
+      const end = Math.min(until, Math.floor(point / DAY) * DAY + DAY);
+      appendHourlyWindow(hourly, { ...hourlyWindow(point, end, "audit", "search", lane), audit: true });
+      point = end;
+    }
+    state.lastAuditDay = day2;
+    state.lastAuditAt = new Date(nowMs).toISOString();
+    state.lastAuditRange = { start: new Date(from).toISOString(), endExclusive: new Date(until).toISOString() };
+  }
 }
 function prepareHourlyLatest(sync, hourly, nowMs) {
   const until = Math.floor(nowMs / 1e3) * 1e3;
-  const previous = Date.parse(hourly.latestPlannedThrough) || Date.parse(sync.discovery.recentThrough) || Date.parse(sync.discovery.recentWindow?.endExclusive);
-  if (Number.isFinite(previous) && previous >= until) return null;
-  const from = Math.floor(Math.max(until - HOUR - INTERVAL, Number.isFinite(previous) ? previous - INTERVAL : until - HOUR - INTERVAL) / 1e3) * 1e3;
-  if (Number.isFinite(previous) && previous < from) {
-    for (let point = previous; point < from; ) {
-      const end = Math.min(from, Math.floor(point / DAY) * DAY + DAY);
-      appendHourlyWindow(hourly, hourlyWindow(point, end, "outage"));
-      point = end;
+  let direct = null;
+  for (const lane of DISCOVERY_LANES) {
+    const state = laneState(hourly, lane);
+    const previous = Date.parse(state.latestPlannedThrough) || (lane === "direct" ? Date.parse(sync.discovery.recentThrough) || Date.parse(sync.discovery.recentWindow?.endExclusive) : NaN);
+    if (Number.isFinite(previous) && previous >= until) continue;
+    const from = Math.floor(Math.max(until - HOUR - INTERVAL, Number.isFinite(previous) ? previous - INTERVAL : until - HOUR - INTERVAL) / 1e3) * 1e3;
+    if (Number.isFinite(previous) && previous < from) {
+      for (let point = previous; point < from; ) {
+        const end = Math.min(from, Math.floor(point / DAY) * DAY + DAY);
+        appendHourlyWindow(hourly, hourlyWindow(point, end, "outage", "search", lane));
+        point = end;
+      }
     }
+    const value = hourlyWindow(from, until, "latest", "search", lane);
+    appendHourlyWindow(hourly, value);
+    state.latestPlannedThrough = value.endExclusive;
+    state.latestRange = { start: value.start, endExclusive: value.endExclusive };
+    if (lane === "direct") direct = hourly.pendingWindows.find((window2) => window2.id === value.id);
   }
-  const value = hourlyWindow(from, until, "latest");
-  appendHourlyWindow(hourly, value);
-  hourly.latestPlannedThrough = value.endExclusive;
-  return hourly.pendingWindows.find((window2) => window2.id === value.id);
+  return direct;
 }
 function chooseHourlyCatchup(hourly) {
-  const oldest = [...hourly.pendingWindows].sort((a, b) => Date.parse(a.start) - Date.parse(b.start))[0];
-  if ((hourly.catchupRequestCount + 1) % 6 === 0) return oldest;
-  const latest = hourly.latestWindow;
-  if (!latest || !timestamp(latest.start) || !timestamp(latest.endExclusive)) return oldest;
-  const from = Date.parse(latest.start), until = Date.parse(latest.endExclusive);
-  return [...hourly.pendingWindows].filter((window2) => (window2.method || "mentions") === "mentions" && Date.parse(window2.start) < until && Date.parse(window2.endExclusive) > from).sort((a, b) => Date.parse(b.start) - Date.parse(a.start) || Date.parse(b.endExclusive) - Date.parse(a.endExclusive))[0] || oldest;
+  const oldest = (values) => [...values].sort((a, b) => Date.parse(a.start) - Date.parse(b.start) || a.id.localeCompare(b.id))[0];
+  if ((hourly.catchupRequestCount + 1) % 6 === 0) {
+    const start2 = Number.isInteger(hourly.oldLaneIndex) ? hourly.oldLaneIndex % DISCOVERY_LANES.length : 0;
+    for (let offset = 0; offset < DISCOVERY_LANES.length; offset++) {
+      const at = (start2 + offset) % DISCOVERY_LANES.length;
+      const value = oldest(hourly.pendingWindows.filter((window2) => window2.discoveryLane === DISCOVERY_LANES[at]));
+      if (value) {
+        hourly.oldLaneIndex = (at + 1) % DISCOVERY_LANES.length;
+        return value;
+      }
+    }
+    return null;
+  }
+  const start = Number.isInteger(hourly.catchupLaneIndex) ? hourly.catchupLaneIndex % DISCOVERY_LANES.length : 0;
+  for (let offset = 0; offset < DISCOVERY_LANES.length; offset++) {
+    const at = (start + offset) % DISCOVERY_LANES.length, lane = DISCOVERY_LANES[at];
+    const values = hourly.pendingWindows.filter((window2) => window2.discoveryLane === lane);
+    if (!values.length) continue;
+    hourly.catchupLaneIndex = (at + 1) % DISCOVERY_LANES.length;
+    const latest = laneState(hourly, lane).latestRange;
+    return latest ? [...values].filter((window2) => Date.parse(window2.start) < Date.parse(latest.endExclusive) && Date.parse(window2.endExclusive) > Date.parse(latest.start)).sort((a, b) => Date.parse(b.start) - Date.parse(a.start) || Date.parse(b.endExclusive) - Date.parse(a.endExclusive))[0] || oldest(values) : oldest(values);
+  }
+  return null;
 }
 function hourlyGap(sync, hourly, value) {
   hourly.gaps.push(value);
   addGap(sync, { ...value, source: "hourly-discovery" });
 }
 function replaceHourlyWithSplit(sync, hourly, index, window2, code, at, details = {}) {
-  const from = Date.parse(window2.start), until = Date.parse(window2.endExclusive);
+  const from = Date.parse(window2.start), until = Date.parse(window2.endExclusive), lane = window2.discoveryLane || "direct";
   if (until - from >= 2 * HOURLY_MIN_WINDOW) {
     const middle = Math.floor((from + until) / 2e3) * 1e3;
-    hourly.pendingWindows.splice(index, 1, hourlyWindow(from, middle, "recovery", window2.method || "mentions"), hourlyWindow(middle, until, "recovery", window2.method || "mentions"));
+    hourly.pendingWindows.splice(index, 1, { ...hourlyWindow(from, middle, "recovery", window2.method || "search", lane), audit: !!window2.audit }, { ...hourlyWindow(middle, until, "recovery", window2.method || "search", lane), audit: !!window2.audit });
     hourly.splitWindows++;
     return "split";
   }
-  hourlyGap(sync, hourly, { code, at, start: window2.start, endExclusive: window2.endExclusive, ...details });
+  hourlyGap(sync, hourly, { code, at, discoveryLane: lane, start: window2.start, endExclusive: window2.endExclusive, ...details });
   hourly.pendingWindows.splice(index, 1);
   return "gap";
 }
-function hourlyKnownMissing(dataset, window2) {
+function hourlyKnownMissing(dataset, window2, state) {
   const seen = new Set(window2.observedPostIds || []), from = Date.parse(window2.start), until = Date.parse(window2.endExclusive);
-  return dataset.posts.filter((post) => !seen.has(post.id) && Date.parse(post.publishedAt) >= from && Date.parse(post.publishedAt) < until && typeof post.authorHandle === "string" && post.authorHandle.toLowerCase() !== TARGET.toLowerCase() && directlyMentioned({ text: post.body })).length;
+  return dataset.posts.filter((post) => (import_model.default.countablePost ? import_model.default.countablePost(post, state).eligible : import_model.default.postEligibility(post).eligible && post.relevance?.status !== "review") && !seen.has(post.id) && Date.parse(post.publishedAt) >= from && Date.parse(post.publishedAt) < until && typeof post.authorHandle === "string" && post.authorHandle.toLowerCase() !== TARGET.toLowerCase() && matchesDiscoveryLane(post, window2.discoveryLane || "direct")).length;
 }
-function promoteHourlyCoverage(hourly) {
-  let point = Date.parse(hourly.completedThrough || hourly.coverageFrom);
+function compactRanges(ranges) {
+  const result = [];
+  for (const range of [...ranges].sort((a, b) => Date.parse(a.start) - Date.parse(b.start))) {
+    const last = result.at(-1);
+    if (last && Date.parse(range.start) <= Date.parse(last.endExclusive)) last.endExclusive = new Date(Math.max(Date.parse(last.endExclusive), Date.parse(range.endExclusive))).toISOString();
+    else result.push({ start: range.start, endExclusive: range.endExclusive });
+  }
+  return result;
+}
+function promoteHourlyCoverage(hourly, lane = "direct") {
+  const state = laneState(hourly, lane);
+  state.completedRanges = compactRanges(state.completedRanges);
+  let point = Date.parse(state.completedThrough || state.coverageFrom);
   if (!Number.isFinite(point)) return;
   const initial = point;
   for (; ; ) {
-    const next = hourly.completedRanges.reduce((end, range) => Date.parse(range.start) <= point && Date.parse(range.endExclusive) > end ? Date.parse(range.endExclusive) : end, point);
+    const next = state.completedRanges.reduce((end, range) => Date.parse(range.start) <= point && Date.parse(range.endExclusive) > end ? Date.parse(range.endExclusive) : end, point);
     if (next === point) break;
     point = next;
   }
-  if (point > initial || hourly.completedThrough) hourly.completedThrough = new Date(point).toISOString();
+  if (point > initial || state.completedThrough) state.completedThrough = new Date(point).toISOString();
 }
 async function advanceHourlyDiscovery(workbench, { client, now, maxRequests = 1, lane = "latest" } = {}) {
   let dataset = import_model.default.validateDataset(copy(workbench.dataset));
   let state = import_model.default.validateState(copy(workbench.state || import_model.default.initialState()));
   const nowMs = instant2(now), at = new Date(nowMs).toISOString();
-  const sync = initialSync(workbench.sync, nowMs), result = () => ({ dataset, state, sync });
+  const sync = initialSync(workbench.sync, nowMs), result = () => {
+    if (sync.hourly?.lanes) mirrorDirect(sync.hourly);
+    return { dataset, state, sync };
+  };
   if (!["latest", "catchup"].includes(lane) || !Number.isInteger(maxRequests) || maxRequests < 0) throw new Error("Invalid hourly discovery action.");
   if (!sync.enabled) {
     sync.status = "disabled";
     return result();
   }
   if (sync.paused || maxRequests === 0) return result();
-  const hourly = hourlyCheckpoint(sync);
+  const hourly = hourlyCheckpoint(sync, at);
   const due = lane === "latest" ? hourly.nextRunAt || sync.nextRunAt : hourly.nextAttemptAt;
   if (due && Date.parse(due) > nowMs) return result();
   migrateHourlyRecent(sync, hourly);
   const chosen = lane === "latest" ? prepareHourlyLatest(sync, hourly, nowMs) : chooseHourlyCatchup(hourly);
+  if (lane === "latest") prepareHourlyAudit(hourly, nowMs);
   if (!chosen) return result();
   const index = hourly.pendingWindows.indexOf(chosen), window2 = copy(chosen);
   if (index < 0 || !timestamp(window2.start) || !timestamp(window2.endExclusive) || Date.parse(window2.start) >= Date.parse(window2.endExclusive) || typeof window2.cursor !== "string" || !Array.isArray(window2.seenCursors)) throw new Error("Invalid checkpoint.");
-  const method = window2.method || "mentions";
+  const method = window2.method || "search";
   if (!["search", "mentions"].includes(method) || !client || typeof client[method === "mentions" ? "mentionsPage" : "searchPage"] !== "function") throw new Error("A read-only collection client is required.");
   const latestDueBefore = hourly.nextRunAt || sync.nextRunAt;
+  const queryLane = window2.discoveryLane || "direct", queryState = laneState(hourly, queryLane);
   sync.phase = "discovery";
   sync.activeLane = lane === "latest" ? "hourly-latest" : "hourly-catchup";
   sync.lastAttemptAt = at;
   sync.requestCount++;
   hourly.requestCount++;
+  queryState.lastAttemptAt = at;
   if (lane === "latest") hourly.lastAttemptAt = at;
   else {
     hourly.catchupLastAttemptAt = at;
     hourly.catchupRequestCount++;
   }
-  const snapshot = { start: window2.start, endExclusive: window2.endExclusive, method, lane, status: "pending" };
+  const snapshot = { start: window2.start, endExclusive: window2.endExclusive, method, lane, discoveryLane: queryLane, status: "pending" };
   hourly.lastWindow = snapshot;
   if (lane === "latest") hourly.latestWindow = { ...snapshot };
   try {
-    const query = "@" + TARGET + " since_time:" + Math.floor(Date.parse(window2.start) / 1e3) + " until_time:" + Math.floor(Date.parse(window2.endExclusive) / 1e3);
+    const query = window2.query || discoveryQuery(window2.start, window2.endExclusive, window2.queryPolicy || "legacy-unfiltered", queryLane);
     const page = method === "mentions" ? await client.mentionsPage({ userName: TARGET, sinceTime: Math.floor(Date.parse(window2.start) / 1e3), untilTime: Math.floor(Date.parse(window2.endExclusive) / 1e3), cursor: window2.cursor }) : await client.searchPage({ query, cursor: window2.cursor });
     if (!page || !Array.isArray(page.tweets) || typeof page.hasNextPage !== "boolean") throw new Error("Invalid discovery response.");
     const incoming = normalizedPage(page.tweets, at, window2);
@@ -1409,6 +1738,7 @@ async function advanceHourlyDiscovery(workbench, { client, now, maxRequests = 1,
     hourly.addedPosts += added;
     hourly.lastPageAdded = added;
     window2.observedPostIds = [.../* @__PURE__ */ new Set([...window2.observedPostIds || [], ...incoming.posts.map((post) => post.id)])];
+    delete window2.consecutiveTimeouts;
     snapshot.returnedPosts = incoming.posts.length;
     snapshot.addedPosts = added;
     if (cycle || jumped || empty) snapshot.status = replaceHourlyWithSplit(sync, hourly, index, window2, cycle ? "CURSOR_CYCLE" : jumped ? "PAGINATION_ORDER" : "EMPTY_CONTINUATION", at);
@@ -1418,20 +1748,24 @@ async function advanceHourlyDiscovery(workbench, { client, now, maxRequests = 1,
       window2.seenCursors = [...window2.seenCursors, page.nextCursor].slice(-1e3);
       hourly.pendingWindows[index] = window2;
     } else {
-      const missing = hourlyKnownMissing(dataset, window2);
+      const missing = hourlyKnownMissing(dataset, window2, state);
       if (missing) {
         snapshot.status = replaceHourlyWithSplit(sync, hourly, index, window2, "KNOWN_POST_NOT_RETURNED", at, { count: missing });
       } else {
         hourly.pendingWindows.splice(index, 1);
-        hourly.completedRanges.push({ start: window2.start, endExclusive: window2.endExclusive });
+        queryState.completedRanges.push({ start: window2.start, endExclusive: window2.endExclusive });
         snapshot.status = "complete";
-        promoteHourlyCoverage(hourly);
+        promoteHourlyCoverage(hourly, queryLane);
       }
     }
     sync.lastSuccessAt = at;
     sync.lastError = null;
     sync.consecutiveFailures = 0;
     sync.status = "running";
+    queryState.lastSuccessAt = at;
+    queryState.lastError = null;
+    queryState.lastWindow = { ...snapshot };
+    if (incoming.posts.length) queryState.lastDataAt = at;
     if (incoming.posts.length) {
       sync.lastDataAt = at;
       if (lane === "latest") hourly.lastDataAt = at;
@@ -1464,6 +1798,8 @@ async function advanceHourlyDiscovery(workbench, { client, now, maxRequests = 1,
     }
     recordError(sync, error, nowMs);
     snapshot.status = "error";
+    queryState.lastError = copy(sync.lastError);
+    queryState.lastWindow = { ...snapshot };
     hourly.nextAttemptAt = sync.nextRunAt;
     if (lane === "latest") {
       hourly.lastError = copy(sync.lastError);
@@ -1473,6 +1809,23 @@ async function advanceHourlyDiscovery(workbench, { client, now, maxRequests = 1,
     } else {
       hourly.catchupLastError = copy(sync.lastError);
       if (!sync.paused) sync.nextRunAt = latestDueBefore;
+    }
+    if (sync.lastError?.diagnosticCode === "REQUEST_TIMEOUT" && !sync.paused) {
+      window2.consecutiveTimeouts = (window2.consecutiveTimeouts || 0) + 1;
+      hourly.pendingWindows[index] = window2;
+      if (window2.consecutiveTimeouts >= 2) {
+        snapshot.status = replaceHourlyWithSplit(sync, hourly, index, window2, "REQUEST_TIMEOUT", at);
+        hourly.lastAnomaly = { code: "REQUEST_TIMEOUT", at };
+        sync.consecutiveFailures = 0;
+        sync.lastError = null;
+        sync.status = "running";
+        hourly.nextAttemptAt = new Date(nowMs + CATCHUP_SPACING).toISOString();
+        if (lane === "latest") hourly.latestWindow = { ...snapshot };
+        else hourly.catchupLastError = null;
+      }
+    } else if (window2.consecutiveTimeouts) {
+      delete window2.consecutiveTimeouts;
+      hourly.pendingWindows[index] = window2;
     }
   }
   hourly.catchupNextAttemptAt = hourly.nextAttemptAt;
@@ -1512,20 +1865,25 @@ function validate(workbench) {
     sync: copy2(workbench.sync || {})
   };
 }
-function window(start, endExclusive) {
+function window(start, endExclusive, method = "search", queryPolicy = DISCOVERY_QUERY_POLICY, discoveryLane = "direct") {
+  const from = new Date(start).toISOString(), until = new Date(endExclusive).toISOString();
+  const filters = [DISCOVERY_QUERY_POLICY, "original-tweets-v1"].includes(queryPolicy) ? " -filter:replies -filter:nativeretweets" : "";
   return {
-    start: new Date(start).toISOString(),
-    endExclusive: new Date(endExclusive).toISOString(),
+    start: from,
+    endExclusive: until,
+    queryPolicy,
+    discoveryLane,
+    query: method === "id-search" ? discoveryTerms(discoveryLane, queryPolicy) + filters + " since_id:" + idBound(start) + " max_id:" + idBound(endExclusive) : discoveryQuery(from, until, queryPolicy, discoveryLane),
     cursor: "",
     previousOldest: null,
     seenCursors: []
   };
 }
-function dailyWindows(start, end) {
+function dailyWindows(start, end, method, lanes) {
   const result = [];
   for (let point = start; point < end; ) {
     const next = Math.min(end, Math.floor(point / DAY2) * DAY2 + DAY2);
-    result.push(window(point, next));
+    for (const lane of lanes) result.push(window(point, next, method, DISCOVERY_QUERY_POLICY, lane));
     point = next;
   }
   return result;
@@ -1539,9 +1897,12 @@ function idBound(timestamp2) {
   if (milliseconds < SNOWFLAKE_EPOCH) throw new Error("ID-search bounds must be after the X Snowflake epoch.");
   return ((milliseconds - SNOWFLAKE_EPOCH << 22n) - 1n).toString();
 }
-function beginBackfill(workbench, { start, endExclusive, requestLimit: limit = 250, method = "search", now } = {}) {
+function beginBackfill(workbench, { start, endExclusive, requestLimit: limit = 250, method = "search", lanes, now } = {}) {
   const result = validate(workbench), nowMs = nowTime(now);
   if (!collectionMethods.has(method)) throw new Error("Invalid backfill method.");
+  const selected = lanes === void 0 ? method === "mentions" ? ["direct"] : [...DISCOVERY_LANES] : lanes;
+  if (!Array.isArray(selected) || !selected.length || selected.some((lane) => !DISCOVERY_LANES.includes(lane)) || new Set(selected).size !== selected.length || method === "mentions" && selected.some((lane) => lane !== "direct")) throw new Error("Invalid backfill lanes.");
+  const selectedLanes = DISCOVERY_LANES.filter((lane) => selected.includes(lane));
   const from = Math.floor(time(start, "start") / 1e3) * 1e3;
   const until = Math.floor(time(endExclusive, "end") / 1e3) * 1e3;
   limit = requestLimit(limit);
@@ -1553,10 +1914,9 @@ function beginBackfill(workbench, { start, endExclusive, requestLimit: limit = 2
   if (result.sync.enabled !== true) throw new Error("Enable the collector before starting a backfill.");
   if (result.sync.paused === true) throw new Error("Resume the collector before starting a backfill.");
   const startIso = new Date(from).toISOString(), endIso = new Date(until).toISOString();
-  const id = "backfill:" + method + ":" + startIso + ":" + endIso;
+  const id = "backfill:" + DISCOVERY_QUERY_POLICY + ":" + selectedLanes.join(",") + ":" + method + ":" + startIso + ":" + endIso;
   const existing = result.sync.backfill;
-  const legacyId = "backfill:" + startIso + ":" + endIso;
-  if (existing && (existing.id === id || method === "search" && existing.id === legacyId && (existing.method || "search") === "search")) {
+  if (existing && existing.id === id && existing.queryPolicy === DISCOVERY_QUERY_POLICY) {
     if (!Number.isInteger(existing.requestCount) || existing.requestCount < 0) throw new Error("Invalid backfill checkpoint.");
     existing.method ||= "search";
     existing.requestLimit = Math.max(requestLimit(existing.requestLimit), limit);
@@ -1570,11 +1930,13 @@ function beginBackfill(workbench, { start, endExclusive, requestLimit: limit = 2
     return result;
   }
   if (existing && activeStatuses.has(existing.status)) throw new Error("A different backfill is already in progress.");
-  const windows = dailyWindows(from, until), at = new Date(nowMs).toISOString();
+  const windows = dailyWindows(from, until, method, selectedLanes), at = new Date(nowMs).toISOString();
   result.sync.backfill = {
-    version: 1,
+    version: 3,
     id,
     method,
+    lanes: selectedLanes,
+    queryPolicy: DISCOVERY_QUERY_POLICY,
     target: TARGET2,
     start: startIso,
     endExclusive: endIso,
@@ -1584,6 +1946,7 @@ function beginBackfill(workbench, { start, endExclusive, requestLimit: limit = 2
     successfulPages: 0,
     addedPosts: 0,
     observedPostIds: [],
+    observedByLane: Object.fromEntries(selectedLanes.map((lane) => [lane, []])),
     measuredPages: 0,
     pageStatsStartedAt: null,
     lastPageStats: null,
@@ -1606,43 +1969,32 @@ function beginBackfill(workbench, { start, endExclusive, requestLimit: limit = 2
   };
   return result;
 }
-function directlyMentioned2(tweet) {
-  return /(^|[^A-Za-z0-9_])@entropyIO(?![A-Za-z0-9_])/i.test(typeof tweet.text === "string" ? tweet.text : "") || Array.isArray(tweet.entities?.user_mentions) && tweet.entities.user_mentions.some((m) => typeof m?.screen_name === "string" && m.screen_name.toLowerCase() === TARGET2.toLowerCase());
-}
 function normalizePage(tweets, observedAt, current) {
-  const data = normalizeTweets(tweets, { observedAt, query: "@" + TARGET2 });
-  const normalizedNonReposts = data.posts.length;
-  const mentionIds = new Set(tweets.filter(directlyMentioned2).map((t) => t.id));
-  const from = Date.parse(current.start), until = Date.parse(current.endExclusive);
-  data.posts = data.posts.filter((post) => mentionIds.has(post.id) && post.authorHandle.toLowerCase() !== TARGET2.toLowerCase() && Date.parse(post.publishedAt) >= from && Date.parse(post.publishedAt) < until);
-  const authorIds = new Set(data.posts.map((post) => post.authorId));
-  data.authors = data.authors.filter((author) => authorIds.has(author.id));
-  data.meta.periodStart = current.start.slice(0, 10);
-  data.meta.periodEndExclusive = new Date(Math.ceil(until / DAY2) * DAY2).toISOString().slice(0, 10);
-  return { data, normalizedNonReposts };
+  const raw = normalizeTweets(tweets, { observedAt, query: current.query || "@" + TARGET2 });
+  return { data: normalizeDiscoveryPage(tweets, observedAt, current), normalizedNonReposts: raw.posts.length };
 }
 function appendGap(sync, job, gap) {
   job.gaps.push(gap);
   sync.gaps = [...Array.isArray(sync.gaps) ? sync.gaps : [], { ...gap, source: "accelerated-backfill" }].slice(-50);
 }
 function missingKnownPosts(result, range, legacyOnly = false) {
-  const job = result.sync.backfill, observed = new Set(job.observedPostIds || []);
+  const job = result.sync.backfill, lane = range.discoveryLane || "direct", observed = new Set(job.observedByLane?.[lane] || job.observedPostIds || []);
   const from = Date.parse(range.start), until = Date.parse(range.endExclusive), startedAt = Date.parse(job.startedAt);
   return result.dataset.posts.filter((post) => {
     const published = Date.parse(post.publishedAt), measured = Date.parse(post.metricsAsOf);
-    return published >= from && published < until && !observed.has(post.id) && typeof post.authorHandle === "string" && post.authorHandle.toLowerCase() !== TARGET2.toLowerCase() && directlyMentioned2({ text: post.body }) && (!legacyOnly || !Number.isFinite(measured) || measured < startedAt);
+    return (import_model2.default.countablePost ? import_model2.default.countablePost(post, result.state).eligible : import_model2.default.postEligibility(post).eligible && post.relevance?.status !== "review") && published >= from && published < until && !observed.has(post.id) && typeof post.authorHandle === "string" && post.authorHandle.toLowerCase() !== TARGET2.toLowerCase() && matchesDiscoveryLane(post, lane) && (!legacyOnly || !Number.isFinite(measured) || measured < startedAt);
   }).length;
 }
 function recordKnownGap(result, range, at, legacyOnly = false) {
   const { sync } = result, job = sync.backfill, count2 = missingKnownPosts(result, range, legacyOnly);
   if (!count2) return;
-  const matches = (gap) => gap.code === "KNOWN_POST_NOT_RETURNED" && gap.start === range.start && gap.endExclusive === range.endExclusive;
+  const matches = (gap) => gap.code === "KNOWN_POST_NOT_RETURNED" && gap.start === range.start && gap.endExclusive === range.endExclusive && (gap.discoveryLane || "direct") === (range.discoveryLane || "direct");
   const existing = job.gaps.find(matches);
   if (existing) {
     existing.count = Math.max(existing.count || 0, count2);
     const mirror = (sync.gaps || []).find(matches);
     if (mirror) mirror.count = existing.count;
-  } else appendGap(sync, job, { code: "KNOWN_POST_NOT_RETURNED", count: count2, at, start: range.start, endExclusive: range.endExclusive });
+  } else appendGap(sync, job, { code: "KNOWN_POST_NOT_RETURNED", count: count2, at, discoveryLane: range.discoveryLane || "direct", start: range.start, endExclusive: range.endExclusive });
 }
 function auditCompletedKnownPosts(result, at) {
   for (const range of result.sync.backfill.completedRanges || []) recordKnownGap(result, range, at, true);
@@ -1653,10 +2005,10 @@ function splitOrGap(sync, job, current, code, at) {
   const from = Date.parse(current.start), until = Date.parse(current.endExclusive);
   if (until - from >= 2 * MIN_WINDOW) {
     const middle = Math.floor((from + until) / 2e3) * 1e3;
-    job.pendingWindows.splice(0, 1, window(from, middle), window(middle, until));
+    job.pendingWindows.splice(0, 1, window(from, middle, job.method || "search", job.queryPolicy || "legacy-unfiltered", current.discoveryLane || "direct"), window(middle, until, job.method || "search", job.queryPolicy || "legacy-unfiltered", current.discoveryLane || "direct"));
     job.splitWindows++;
   } else {
-    appendGap(sync, job, { code, at, start: current.start, endExclusive: current.endExclusive });
+    appendGap(sync, job, { code, at, discoveryLane: current.discoveryLane || "direct", start: current.start, endExclusive: current.endExclusive });
     job.pendingWindows.shift();
   }
 }
@@ -1676,6 +2028,7 @@ function finish(result, nowMs) {
   job.nextAttemptAt = null;
   job.status = job.gaps.length ? "complete-with-gaps" : "complete";
   if (job.gaps.length) return;
+  if (Array.isArray(job.lanes) && !job.lanes.includes("direct")) return;
   const from = Date.parse(job.start), until = Date.parse(job.endExclusive);
   const discovery = sync.discovery ||= { pendingWindows: [], coveredThrough: null };
   const pending = Array.isArray(discovery.pendingWindows) ? discovery.pendingWindows : [];
@@ -1717,7 +2070,7 @@ function failure(result, error, nowMs) {
   if (job.status === "paused") sync.paused = true;
   const current = job.pendingWindows[0];
   if (job.lastError.diagnosticCode === "REQUEST_TIMEOUT" && current) {
-    const key = current.start + "/" + current.endExclusive + "/" + current.cursor;
+    const key = (current.discoveryLane || "direct") + "/" + current.start + "/" + current.endExclusive + "/" + current.cursor;
     job.consecutiveTimeouts = job.timeoutWindow === key ? (job.consecutiveTimeouts || 0) + 1 : 1;
     job.timeoutWindow = key;
     if (job.consecutiveTimeouts >= 2) {
@@ -1774,11 +2127,12 @@ async function advanceBackfill(workbench, { client, now } = {}) {
   sync.lastAttemptAt = at;
   sync.requestCount = (Number.isInteger(sync.requestCount) ? sync.requestCount : 0) + 1;
   try {
-    const query = method === "id-search" ? "@" + TARGET2 + " since_id:" + idBound(from) + " max_id:" + idBound(until) : "@" + TARGET2 + " since_time:" + Math.floor(from / 1e3) + " until_time:" + Math.floor(until / 1e3);
+    const query = current.query || window(from, until, method, job.queryPolicy || "legacy-unfiltered", current.discoveryLane || "direct").query;
     const page = method === "mentions" ? await client.mentionsPage({ userName: TARGET2, sinceTime: Math.floor(from / 1e3), untilTime: Math.floor(until / 1e3), cursor: current.cursor }) : await client.searchPage({ query, cursor: current.cursor });
     if (!page || !Array.isArray(page.tweets) || typeof page.hasNextPage !== "boolean") throw new Error("Invalid discovery response.");
     const times = page.tweets.map((tweet) => Date.parse(tweet?.createdAt)).filter(Number.isFinite);
     job.lastPageStats = {
+      discoveryLane: current.discoveryLane || "direct",
       rawTweets: page.tweets.length,
       normalizedNonReposts: null,
       inRangeMentions: null,
@@ -1802,6 +2156,11 @@ async function advanceBackfill(workbench, { client, now } = {}) {
     result.dataset = merged;
     result.state = migrated;
     job.observedPostIds = [.../* @__PURE__ */ new Set([...job.observedPostIds || [], ...incoming.posts.map((post) => post.id)])];
+    if (job.queryPolicy === DISCOVERY_QUERY_POLICY) {
+      job.observedByLane ||= {};
+      const lane = current.discoveryLane || "direct";
+      job.observedByLane[lane] = [.../* @__PURE__ */ new Set([...job.observedByLane[lane] || [], ...incoming.posts.map((post) => post.id)])];
+    }
     job.successfulPages++;
     job.addedPosts += added;
     job.lastPageAdded = added;
@@ -1822,12 +2181,15 @@ async function advanceBackfill(workbench, { client, now } = {}) {
       current.cursor = page.nextCursor;
       current.previousOldest = times.length ? Math.min(...times) : current.previousOldest;
       current.seenCursors = [...current.seenCursors, page.nextCursor].slice(-1e3);
-      job.pendingWindows[0] = current;
+      if ((job.lanes || []).length > 1) {
+        job.pendingWindows.shift();
+        job.pendingWindows.push(current);
+      } else job.pendingWindows[0] = current;
     } else {
       recordKnownGap(result, current, at);
       job.pendingWindows.shift();
       job.completedWindows++;
-      job.completedRanges.push({ start: current.start, endExclusive: current.endExclusive });
+      job.completedRanges.push({ start: current.start, endExclusive: current.endExclusive, discoveryLane: current.discoveryLane || "direct" });
     }
     if (!job.pendingWindows.length) finish(result, nowMs);
     else if (job.requestCount >= job.requestLimit) {
@@ -2488,5 +2850,6 @@ export {
   beginBackfill,
   createClient,
   mergeDataset,
+  normalizeDiscoveryPage,
   seed_default as seed
 };

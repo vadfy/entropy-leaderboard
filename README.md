@@ -14,11 +14,27 @@ Source snapshot of the @entropyIO contributor leaderboard: an owner-private mode
 
 ## Current behavior
 
-The leaderboard defaults to counted-post impressions, with likes, comments, reposts, quotes, Engagement % and Score. Creator views show collected posts; moderation can exclude individual posts, exclude an author for a calendar month, ban an author and restore decisions with an audit trail. UTC calendar months are used. Engagement % is `100 × (likes + reposts + quotes) / impressions` over counted posts; comments are shown separately. Unknown observations remain unknown.
+The leaderboard defaults to counted-post impressions, with likes, comments, reposts, quotes, Engagement % and Score. Creator views show collected posts; moderation can exclude individual posts, exclude an author for a calendar month, ban an author and restore decisions with an audit trail. UTC calendar months are used. Engagement % is `100 × (likes + reposts + quotes) / impressions` over counted posts; comments are shown separately. Unknown observations remain unknown. Replies and plain reposts do not count as creator posts; relevant quote posts can count. Post-type evidence is checked after retrieval as well as through search filters and cannot be erased by a partial refresh or replacement import.
 
 The full Entropy Score is adapted from the supplied Zama v0.1 model and requires complete inputs, including smart-audience and smart-engagement evidence. Missing inputs display an explicit unavailable/pending state rather than a fabricated zero. Kaito is not connected. Personal creator authentication is deferred. Public visitors see counted posts and public metrics, not bans, exclusion reasons, internal notes, private trust evidence, scoring implementation or administration controls.
 
-Historical coverage remains partial. Provider counters do not establish organic reach or unique audience, and posts can have different metric-refresh timestamps.
+## Entropy discovery and review
+
+The current discovery policy is `entropy-context-v1`, with three independent search lanes:
+
+| Lane | Search scope |
+| --- | --- |
+| `direct` | Explicit `@entropyIO` mentions. |
+| `evidence` | Links to `entropy.io` or official `@entropyIO` post URLs. |
+| `context` | The name “Entropy”, followed by project-relevance checks. |
+
+`entropy-app/relevance.mjs` checks each post's own public evidence. Direct mentions establish relevance. Posts without a tag can qualify through official-domain links, official-post links or quote metadata identifying `@entropyIO`. Name-only posts require product context together with Hyperliquid or HIP-3 context for automatic acceptance. Without a stronger project anchor, recognized other-project and unrelated scientific references are rejected; ambiguous or conflicting matches remain in a private review queue and contribute nothing until a moderator approves them. Decisions require a reason, are stored by exact Post ID and survive collection refreshes. Relevance approval never overrides reply/repost exclusion.
+
+Each lane retains its own cursor, time window, error and progress. New direct mentions have priority; bounded maintenance advances pending pages across all lanes and revisits recent days for delayed indexing. Historical backfills are separate, bounded jobs. Cursor completion is not a claim that the provider returned every X post: known gaps and anomalies remain visible, and historical coverage stays partial.
+
+The private workbench accepts a post's X URL/ID for explicit repair, submitting exact IDs to `/api/repair` (or a bounded service request with `action: "repair"`). This performs a provider lookup, applies the same identity, relevance and post-type checks, and preserves moderation. It is not triggered by ordinary page reads.
+
+Provider counters do not establish organic reach or unique audience. Posts can have different metric-refresh timestamps; a partial response preserves previous known counts and their observation times.
 
 ## Runtime secrets and storage
 
@@ -39,11 +55,11 @@ D1 schema declarations and generated schema-only Drizzle migrations are included
 
 ## Hourly collection
 
-Collection runs in two external cloud schedules attached to the private Site: fresh mentions hourly at minute 35 and bounded catch-up/metric maintenance hourly at minute 45, using Europe/Warsaw time. They work with the browser closed. These are hosting-platform schedules; copying this repository to GitHub does not create GitHub Actions or migrate those schedules. Existing collection continues independently of this repository. See `entropy-cloud/OPERATIONS.md` for the service protocol and limits.
+Collection runs in two external cloud schedules attached to the private Site: fresh direct mentions hourly at minute 35, with other discovery lanes queued for maintenance, and bounded catch-up/metric maintenance hourly at minute 45, using Europe/Warsaw time. They work with the browser closed. Paused or disabled collection is not automatically re-enabled. These are hosting-platform schedules; copying this repository to GitHub does not create GitHub Actions or migrate those schedules. Existing collection continues independently of this repository. See `entropy-cloud/OPERATIONS.md` for the service protocol, request budgets, concurrency leases and limits.
 
 ## Development and validation
 
-Use Node.js 22.13+ and pnpm 11.25.0. Tests use synthetic provider responses or local fixtures and need no real API credentials. GitHub browser uploads can normalize file permissions; restore the five shell entrypoints before installation or building. From the repository root:
+Use Node.js 22.13+ and pnpm 11.25.0. Tests use synthetic provider responses or local fixtures and need no real API credentials. Browser uploads normalize executable file permissions; restore the five shell entrypoints before installation or building. From the repository root:
 
 ```sh
 chmod +x entropy-cloud/scripts/build-verified.sh \

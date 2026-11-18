@@ -8,6 +8,11 @@
   const isNumber = v => typeof v === 'number' && Number.isFinite(v) && v >= 0;
   const safeId = v => typeof v === 'string' && v.trim() === v && v.length > 0 && !['__proto__', 'prototype', 'constructor'].includes(v);
   const plain = v => !!v && typeof v === 'object' && !Array.isArray(v);
+  function confirmedRelevance(r) {
+    if (!plain(r) || r.version !== 'entropy-context-v1' || !Array.isArray(r.reasonCodes) || !Array.isArray(r.signals)) return false;
+    return ['DIRECT_MENTION', 'OFFICIAL_DOMAIN', 'OFFICIAL_POST_LINK', 'OFFICIAL_QUOTE'].some(code => r.reasonCodes.includes(code) && r.signals.includes(code.toLowerCase()))
+      || r.reasonCodes.includes('PROJECT_CONTEXT') && ['brand_name', 'product_context'].every(code => r.signals.includes(code)) && ['hyperliquid_context', 'hip3_context'].some(code => r.signals.includes(code));
+  }
   function isoDate(v) {
     if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
     const n = new Date(v + 'T00:00:00Z');
@@ -41,7 +46,15 @@
         if (v !== null && v !== undefined && !isNumber(v)) throw new Error('Некоректна метрика ' + k + ' у пості ' + p.id);
         metrics[k] = v ?? null;
       }
-      return { ...p, date: day, metrics, summary: typeof p.summary === 'string' ? p.summary : '', body: typeof p.body === 'string' ? p.body : null };
+      let relevance;
+      if (p.relevance !== undefined && p.relevance !== null) {
+        const r = p.relevance;
+        const codes = values => Array.isArray(values) && values.length <= 32 && values.every(v => typeof v === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(v));
+        const acceptedProof = confirmedRelevance(r);
+        if (!plain(r) || r.version !== 'entropy-context-v1' || !['accepted', 'review', 'rejected'].includes(r.status) || !codes(r.reasonCodes || []) || !codes(r.signals || []) || r.status === 'accepted' && !acceptedProof) throw new Error('Некоректний висновок про належність поста до Entropy.');
+        relevance = { ...r, reasonCodes: [...(r.reasonCodes || [])], signals: [...(r.signals || [])] };
+      }
+      return { ...p, ...(relevance ? { relevance } : {}), date: day, metrics, summary: typeof p.summary === 'string' ? p.summary : '', body: typeof p.body === 'string' ? p.body : null };
     });
     const accounts = Array.isArray(raw.accounts) ? raw.accounts : [];
     const accountIds = new Set();
@@ -72,9 +85,41 @@
     Object.values(reviews || {}).forEach(a => byId.set(a.id, { ...(byId.get(a.id) || {}), ...a }));
     return [...byId.values()];
   }
+  function postEligibility(post) {
+    const reference = value => typeof value === 'string' ? value.trim().length > 0 : typeof value === 'number' && Number.isFinite(value);
+    if (post.isReply === true || reference(post.inReplyToId)) return { eligible: false, reason: 'reply' };
+    if (post.isRetweet === true || post.isRepost === true || plain(post.retweeted_tweet) || reference(post.retweeted_tweet)
+      || reference(post.retweetedTweetId) || reference(post.repostedTweetId)) return { eligible: false, reason: 'repost' };
+    // Old imports may have no post-kind facts. A conversation ID alone does not
+    // establish a reply, and absent facts must not become a verified original.
+    return { eligible: true, reason: null };
+  }
+  function relevanceEligibility(post, state = {}) {
+    const decision = state.postRelevance?.[post.id];
+    // These editorial decisions are independent of new provider observations.
+    if (decision?.action === 'reject') return { eligible: false, reason: 'relevance-rejected', manual: true };
+    if (decision?.action === 'approve') return { eligible: true, reason: 'relevance-approved', manual: true };
+    if (!post.relevance) return { eligible: true, reason: 'legacy', manual: false };
+    if (post.relevance.status === 'accepted') return confirmedRelevance(post.relevance) ? { eligible: true, reason: 'relevance-confirmed', manual: false } : { eligible: false, reason: 'relevance-review', manual: false };
+    return { eligible: false, reason: post.relevance.status === 'review' ? 'relevance-review' : 'relevance-rejected', manual: false };
+  }
+  function countablePost(post, state = {}) {
+    const kind = postEligibility(post);
+    return kind.eligible ? relevanceEligibility(post, state) : kind;
+  }
+  function relevanceQueue(dataset, state, query = '') {
+    const search = String(query).trim().toLowerCase();
+    const authors = new Map(dataset.authors.map(author => [author.id, author]));
+    return dataset.posts.filter(post => postEligibility(post).eligible && relevanceEligibility(post, state).reason === 'relevance-review')
+      .filter(post => !search || [post.body, post.summary, authors.get(post.authorId)?.handle, authors.get(post.authorId)?.displayName].join(' ').toLowerCase().includes(search))
+      .sort((a, b) => String(b.publishedAt || b.date).localeCompare(String(a.publishedAt || a.date)) || b.id.localeCompare(a.id));
+  }
   function aggregateAuthor(dataset, state, author, period) {
     const allPosts = dataset.posts.filter(p => p.authorId === author.id && p.date >= period.start && p.date < period.endExclusive);
-    const posts = allPosts.filter(p => !state.postExclusions[p.id]);
+    const eligiblePosts = allPosts.filter(p => countablePost(p, state).eligible);
+    const ignoredPosts = allPosts.filter(p => !countablePost(p, state).eligible);
+    const pendingPosts = allPosts.filter(p => postEligibility(p).eligible && relevanceEligibility(p, state).reason === 'relevance-review');
+    const posts = eligiblePosts.filter(p => !state.postExclusions[p.id]);
     const works = [...new Set(posts.map(p => p.workId || p.id))];
     const periodDecision = state.periodDecisions[period.key + '|' + author.id];
     const ban = state.bans[author.id];
@@ -89,8 +134,8 @@
     const score = Scoring.scoreAuthor({ impressions: metrics.impressions, likes: metrics.likes, reposts: metrics.reposts, quotes: metrics.quotes,
       followers: author.followers, smartFollowers: smart.smartFollowers, smartEngagement: smart.smartEngagement,
       posts: works.length, smartFollowersComplete, smartEngagementComplete });
-    const status = ban ? 'banned' : periodDecision || (allPosts.length > 0 && posts.length === 0) ? 'excluded' : allPosts.length === 0 ? 'no-posts' : score.requiresReview ? 'review' : 'active';
-    return { author, allPosts, posts, works, metrics, smart, smartFollowersComplete, smartEngagementComplete, score, manual, status, participates: !manual && posts.length > 0 };
+    const status = ban ? 'banned' : periodDecision || (eligiblePosts.length > 0 && posts.length === 0) ? 'excluded' : eligiblePosts.length === 0 ? pendingPosts.length ? 'review' : 'no-posts' : score.requiresReview ? 'review' : 'active';
+    return { author, allPosts, eligiblePosts, ignoredPosts, pendingPosts, posts, works, metrics, smart, smartFollowersComplete, smartEngagementComplete, score, manual, status, participates: !manual && posts.length > 0 };
   }
   function decision(state, payload, now) {
     const next = JSON.parse(JSON.stringify(state));
@@ -104,6 +149,12 @@
     else if (type === 'restore-ban') delete next.bans[authorId];
     else if (type === 'restore-period') delete next.periodDecisions[periodKey + '|' + authorId];
     else if (type === 'restore-post') delete next.postExclusions[postId];
+    else if (type === 'approve-relevance' || type === 'reject-relevance') {
+      if (!safeId(postId) || !safeId(authorId)) throw new Error('Потрібні ID поста й автора.');
+      next.postRelevance ||= {};
+      next.postRelevance[postId] = { ...record, authorId, action: type === 'approve-relevance' ? 'approve' : 'reject' };
+    }
+    else if (type === 'restore-relevance') delete (next.postRelevance ||= {})[postId];
     else throw new Error('Невідомий тип рішення.');
     next.audit.unshift({ id: 'event:' + now + ':' + next.audit.length, type, authorId, postId: postId || null, periodKey, ...record });
     next.audit = next.audit.slice(0, 1000);
@@ -116,9 +167,9 @@
     const publicDecision = d => d ? { reason: d.reason, at: d.at } : null;
     return { author: { id: author.id, handle: author.handle }, period: { start: period.start, endExclusive: period.endExclusive },
       status: a.status, decision: publicDecision(a.manual), includedPosts: a.manual ? 0 : a.posts.length,
-      excludedPosts: a.allPosts.filter(p => state.postExclusions[p.id]).map(p => ({ id: p.id, url: p.url, date: p.date, ...publicDecision(state.postExclusions[p.id]) })) };
+      excludedPosts: a.eligiblePosts.filter(p => state.postExclusions[p.id]).map(p => ({ id: p.id, url: p.url, date: p.date, ...publicDecision(state.postExclusions[p.id]) })) };
   }
-  function initialState() { return { version: 1, bans: {}, periodDecisions: {}, postExclusions: {}, accountReviews: {}, identityEvidence: {}, audit: [], snapshots: [], ui: { view: 'leaderboard', period: '2026-11', sort: 'impressions', status: 'active', search: '' } }; }
+  function initialState() { return { version: 1, bans: {}, periodDecisions: {}, postExclusions: {}, postRelevance: {}, accountReviews: {}, identityEvidence: {}, audit: [], snapshots: [], ui: { view: 'leaderboard', period: '2026-11', sort: 'impressions', status: 'active', search: '' } }; }
   function validateState(raw) {
     if (!plain(raw) || raw.version !== 1) throw new Error('Непідтримувана версія збереженого стану.');
     const result = initialState();
@@ -127,6 +178,13 @@
       for (const [id, record] of Object.entries(raw[k])) {
         if (!safeId(id) || !plain(record) || typeof record.reason !== 'string' || record.reason.trim().length < 3 || typeof record.at !== 'string' || !Number.isFinite(Date.parse(record.at)) || (record.internalNote !== undefined && typeof record.internalNote !== 'string')) throw new Error('Некоректний запис рішення.');
         result[k][id] = { ...record, internalNote: record.internalNote || '' };
+      }
+    }
+    if (raw.postRelevance !== undefined) {
+      if (!plain(raw.postRelevance) || Object.keys(raw.postRelevance).length > 100000) throw new Error('Некоректний список перевірок згадок.');
+      for (const [id, record] of Object.entries(raw.postRelevance)) {
+        if (!safeId(id) || !plain(record) || !safeId(record.authorId) || !['approve', 'reject'].includes(record.action) || typeof record.reason !== 'string' || record.reason.trim().length < 3 || typeof record.at !== 'string' || !Number.isFinite(Date.parse(record.at)) || record.internalNote !== undefined && typeof record.internalNote !== 'string') throw new Error('Некоректне рішення перевірки згадки.');
+        result.postRelevance[id] = { ...record, internalNote: record.internalNote || '' };
       }
     }
     if (!plain(raw.accountReviews)) throw new Error('Некоректний список оцінок акаунтів.');
@@ -151,11 +209,11 @@
         result.identityEvidence[id] = { id, handle: record.handle, postIds: [...record.postIds] };
       }
     }
-    const eventTypes = ['ban', 'exclude-period', 'exclude-post', 'restore-ban', 'restore-period', 'restore-post', 'account-review'];
+    const eventTypes = ['ban', 'exclude-period', 'exclude-post', 'restore-ban', 'restore-period', 'restore-post', 'approve-relevance', 'reject-relevance', 'restore-relevance', 'account-review'];
     if (!Array.isArray(raw.audit) || raw.audit.length > 1000 || raw.audit.some(e => !plain(e) || !eventTypes.includes(e.type) || typeof e.at !== 'string' || !Number.isFinite(Date.parse(e.at)) || typeof e.reason !== 'string' || (e.internalNote !== undefined && typeof e.internalNote !== 'string'))) throw new Error('Некоректний журнал рішень.');
     result.audit = raw.audit;
     const ui = raw.ui;
-    if (!plain(ui) || !['leaderboard', 'audience', 'method', 'settings'].includes(ui.view) || !['impressions', 'score', 'likes', 'replies'].includes(ui.sort) || !['active', 'review', 'excluded', 'banned', 'all'].includes(ui.status) || typeof ui.search !== 'string' || !(ui.period === 'sample' || /^\d{4}-(0[1-9]|1[0-2])$/.test(ui.period))) throw new Error('Некоректні налаштування перегляду.');
+    if (!plain(ui) || !['leaderboard', 'review', 'audience', 'method', 'settings'].includes(ui.view) || !['impressions', 'score', 'likes', 'replies'].includes(ui.sort) || !['active', 'review', 'excluded', 'banned', 'all'].includes(ui.status) || typeof ui.search !== 'string' || !(ui.period === 'sample' || /^\d{4}-(0[1-9]|1[0-2])$/.test(ui.period))) throw new Error('Некоректні налаштування перегляду.');
     result.ui = { ...ui };
     return result;
   }
@@ -196,6 +254,7 @@
     const authorReferenced = id => Object.hasOwn(migrated.bans, id)
       || Object.keys(migrated.periodDecisions).some(k => k.endsWith('|' + id))
       || Object.entries(migrated.postExclusions).some(([postId, d]) => d.authorId === id || previousPosts.get(postId)?.authorId === id)
+      || Object.entries(migrated.postRelevance).some(([postId, d]) => d.authorId === id || previousPosts.get(postId)?.authorId === id)
       || migrated.audit.some(e => e.authorId === id || e.accountId === id)
       || Object.hasOwn(migrated.accountReviews, id);
     for (const [oldId, newId] of mappings) {
@@ -246,6 +305,7 @@
       return key;
     });
     migrated.postExclusions = remapKeys(migrated.postExclusions, id => id, record => ({ ...record, ...(record.authorId ? { authorId: remap(record.authorId) } : {}) }));
+    migrated.postRelevance = remapKeys(migrated.postRelevance, id => id, record => ({ ...record, authorId: remap(record.authorId) }));
     // Audience reviews are identity-bound too. Only an identical sample ID with
     // the same post-backed mapping is moved; a matching handle is never used.
     migrated.accountReviews = remapKeys(migrated.accountReviews, remap, record => ({ ...record, id: remap(record.id) }));
@@ -254,5 +314,5 @@
       ...(event.accountId ? { accountId: remap(event.accountId) } : {}) }));
     return validateState(migrated);
   }
-  return { validateDataset, validateState, reconcileImport, periodFor, sumKnown, reviewAccounts, aggregateAuthor, decision, creatorView, initialState, safeId };
+  return { validateDataset, validateState, reconcileImport, periodFor, sumKnown, reviewAccounts, postEligibility, relevanceEligibility, countablePost, relevanceQueue, aggregateAuthor, decision, creatorView, initialState, safeId };
 });

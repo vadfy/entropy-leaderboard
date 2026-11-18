@@ -1,4 +1,4 @@
-import { getStatus, runSync, runHourlyCatchup, runMetricsRefresh, WorkbenchError } from '../../../lib/workbench';
+import { getStatus, runSync, runHourlyCatchup, runMetricsRefresh, runPostRepair, WorkbenchError } from '../../../lib/workbench';
 
 export const dynamic = 'force-dynamic';
 const LIMIT = 1024;
@@ -29,8 +29,11 @@ async function checkRequest(request: Request) {
   try {
     const value = JSON.parse(new TextDecoder().decode(bytes));
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('A JSON object is required.');
-    if (!Object.keys(value).length) return 'latest';
-    if (Object.keys(value).length === 1 && ['catchup', 'metrics'].includes(value.action)) return value.action;
+    if (!Object.keys(value).length) return { action: 'latest' };
+    if (Object.keys(value).length === 1 && ['catchup', 'metrics'].includes(value.action)) return value;
+    if (Object.keys(value).length === 2 && value.action === 'repair' && Array.isArray(value.ids)
+        && value.ids.length >= 1 && value.ids.length <= 20 && new Set(value.ids).size === value.ids.length
+        && value.ids.every((id: unknown) => typeof id === 'string' && /^[1-9]\d{0,24}$/.test(id))) return value;
     throw new Error('Unsupported action.');
   } catch { throw new WorkbenchError(400, 'INVALID_INPUT', 'Send {} or an explicit maintenance action.'); }
 }
@@ -44,10 +47,11 @@ export async function GET() {
 }
 export async function POST(request: Request) {
   try {
-    const action = await checkRequest(request);
+    const { action, ids } = await checkRequest(request);
     // Ordinary {} always checks the newest hourly window. A bounded explicit
     // continuation never replaces that slot or enables/resumes collection.
-    const result = action === 'catchup' ? await runHourlyCatchup() : action === 'metrics' ? await runMetricsRefresh() : await runSync();
+    const result = action === 'catchup' ? await runHourlyCatchup() : action === 'metrics' ? await runMetricsRefresh()
+      : action === 'repair' ? await runPostRepair(ids) : await runSync();
     return response({ revision: result.revision, updatedAt: result.updatedAt, mode: result.mode,
       connection: result.connection, sync: result.sync, authors: result.dataset.authors.length, posts: result.dataset.posts.length });
   } catch (error) { return errorResponse(error); }

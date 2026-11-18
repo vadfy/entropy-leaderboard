@@ -10,6 +10,8 @@ assert.ok(tail>0);
 source=source.slice(0,tail)+`  render = () => {};
   window.test = {applySnapshot,saveState,saveDecision,refreshBackend,importFile,exportCurrent,collectorAction,sourceStatus,
   authorPosts,openAuthor,closeAuthor,changeAuthorScope,moreAuthorPosts,getAuthor,renderBoard,filtered,engagementPercent,engagementLabel,scoreCell,
+  renderReview,moderateRelevance,repairPost,postIdFromInput,hourlyProgress,relevanceSummary,
+  review:value=>{reviewQuery=value.query??reviewQuery;reviewPage=value.page??reviewPage;},
   get:()=>({dataset,state,backend,serverState,busy,selected,authorPostScope,authorPostLimit}), ui:value=>{state.ui={...state.ui,...value};},
   context:value=>{modalContext=value;}};
 })();`;
@@ -111,6 +113,25 @@ function postFixture(){
  await h.t.refreshBackend();assert.equal(calls,1);assert.equal(h.t.get().backend.revision,6);checks++;
 }
 {
+ const h=harness(), {data,authorId}=postFixture(), base=data.posts.find(post=>post.id==='fixture-1');
+ const make=(id,facts={})=>({...base,id,workId:id,date:'2026-11-10',url:'https://x.com/example/status/'+id,body:id+' Entropy body',metrics:{...base.metrics,impressions:1000,likes:10,reposts:2,quotes:1,replies:5},...facts});
+ data.posts=[make('policy-root'),make('policy-quote',{isQuote:true}),make('policy-reply',{isReply:true}),make('policy-self-reply',{isReply:false,inReplyToId:'policy-root'}),make('policy-repost',{isRetweet:true})];
+ const state=M.decision(M.initialState(),{type:'exclude-post',authorId,postId:'policy-reply',reason:'Earlier manual reply reason'},'2026-11-18T12:00:00Z');
+ h.t.applySnapshot({...snapshot(5,state),dataset:data});h.t.openAuthor(authorId,h.element('trigger'));
+ const a=h.t.getAuthor(authorId), html=h.element('detail-panel').innerHTML;
+ assert.equal(a.posts.length,2);assert.equal(a.metrics.impressions,2000);assert.equal(h.t.engagementPercent(a),1.3);
+ assert.ok(html.includes('реплаї')||html.includes('Реплаї'));assert.ok(html.includes('Показано 5 із 5'));
+ for(const id of ['policy-reply','policy-self-reply','policy-repost']){
+  const card=html.split('data-post-id="'+id+'"')[1].split('</article>')[0];
+  assert.ok(card.includes(id+' Entropy body'));assert.ok(card.includes('не враховується'));
+  assert.ok(!card.includes('data-action="restore-post"'));assert.ok(!card.includes('data-action="moderate-post"'));
+ }
+ assert.ok(html.includes('Earlier manual reply reason'));
+ const original=html.split('data-post-id="policy-root"')[1].split('</article>')[0];
+ assert.ok(original.includes('Враховано в метриках'));assert.ok(original.includes('data-action="moderate-post"'));
+ assert.equal(h.t.get().state.audit.length,1);checks++;
+}
+{
  const h=harness();h.t.openAuthor(seed.authors[0].id,h.element('trigger'));let calls=0;
  h.context.fetch=async()=>{calls++;return response(200,snapshot(6));};await h.t.refreshBackend();
  assert.equal(calls,1);assert.equal(h.t.get().backend.status,'connected');checks++;
@@ -184,6 +205,75 @@ function postFixture(){
  assert.equal(h.t.scoreCell(aggregate),'123,4');
  aggregate.score.status='review';
  assert.ok(h.t.scoreCell(aggregate).includes('Попередній · на перевірці'));checks++;
+}
+
+{
+ const h=harness(),{data,authorId}=postFixture(),base=data.posts[0];
+ const review={version:'entropy-context-v1',status:'review',reasonCodes:['AMBIGUOUS_ENTROPY'],signals:['brand_name']};
+ data.posts=Array.from({length:25},(_,n)=>({...base,id:'review-'+n,authorId,date:'2026-11-'+String(n+1).padStart(2,'0'),body:'Entropy <script>alert(1)</script> '+n,relevance:structuredClone(review)}));
+ h.t.applySnapshot({...snapshot(5),dataset:data}); h.t.renderReview();
+ let html=h.element('review-content').innerHTML;
+ assert.equal((html.match(/data-review-post-id=/g)||[]).length,20);assert.ok(html.includes('Очікують перевірки: 25'));assert.ok(html.includes('&lt;script&gt;'));assert.ok(!html.includes('<script>'));
+ assert.ok(html.includes('data-action="approve-relevance"'));assert.ok(html.includes('data-action="reject-relevance"'));assert.equal(h.t.getAuthor(authorId).posts.length,0);
+ const firstIds=[...html.matchAll(/data-review-post-id="([^"]+)"/g)].map(match=>match[1]);
+ h.t.review({page:1});h.t.renderReview();html=h.element('review-content').innerHTML;
+ const lastIds=[...html.matchAll(/data-review-post-id="([^"]+)"/g)].map(match=>match[1]);
+ assert.equal(lastIds.length,5);assert.equal(new Set([...firstIds,...lastIds]).size,25);
+ h.t.review({query:'Entropy <script>alert(1)</script> 24',page:0});h.t.renderReview();assert.equal((h.element('review-content').innerHTML.match(/data-review-post-id=/g)||[]).length,1);checks++;
+}
+{
+ const h=harness();h.t.applySnapshot(snapshot(5));const post=seed.posts[0];
+ const next=M.decision(h.t.get().state,{type:'reject-relevance',authorId:post.authorId,postId:post.id,reason:'Different Entropy context',internalNote:'PRIVATE_CONTEXT_DRAFT'},'2026-11-18T12:00:00Z');
+ let posted;h.context.fetch=async(path,options)=>{posted=JSON.parse(options.body);assert.equal(path,'/api/state');return response(200,snapshot(6,posted.state));};
+ await h.t.saveState(next);assert.equal(posted.state.postRelevance[post.id].action,'reject');assert.equal(h.t.get().state.postRelevance[post.id].internalNote,'PRIVATE_CONTEXT_DRAFT');checks++;
+}
+{
+ const h=harness();
+ for(const input of ['https://x.com/author/status/2122895908258054477?s=20','https://twitter.com/i/web/status/2122895908258054477','2122895908258054477'])assert.equal(h.t.postIdFromInput(input),'2122895908258054477');
+ for(const input of ['https://x.com.evil.test/author/status/12','http://x.com/author/status/12','https://user:pass@x.com/author/status/12','https://x.com:4433/author/status/12','https://x.com/author','javascript:alert(1)','-1','0'])assert.equal(h.t.postIdFromInput(input),null);
+ h.t.applySnapshot(snapshot(5));h.element('repair-post-input').value='https://example.com/not-a-post';let calls=0;
+ h.context.fetch=async()=>{calls++;throw new Error('Must not call provider for invalid input');};await h.t.repairPost();assert.equal(calls,0);assert.ok(h.element('repair-post-result').textContent.includes('коректне'));checks++;
+}
+{
+ const h=harness(),timeouts=[];h.t.applySnapshot(snapshot(5));h.element('repair-post-input').value='https://x.com/quang250802/status/2122895908258054477';
+ h.context.AbortSignal={timeout:value=>{timeouts.push(value);return undefined;}};
+ let posted;h.context.fetch=async(path,options)=>{assert.equal(path,'/api/repair');posted=JSON.parse(options.body);return response(200,{...snapshot(6),sync:{enabled:true,postRepair:{status:'complete',queuedForReview:1,accepted:0}}});};
+ await h.t.repairPost();assert.equal(posted.expectedRevision,5);assert.deepEqual(posted.ids,['2122895908258054477']);assert.equal(timeouts.at(-1),90000);assert.ok(h.element('repair-post-result').textContent.includes('черги перевірки'));assert.equal(h.t.get().backend.revision,6);checks++;
+}
+{
+ const h=harness();h.t.applySnapshot(snapshot(5));h.element('repair-post-input').value='2122712010097844473';let calls=0,release;
+ h.context.fetch=async()=>{calls++;return new Promise(resolve=>{release=()=>resolve(response(200,{...snapshot(6),sync:{postRepair:{status:'complete',accepted:1}}}));});};
+ const first=h.t.repairPost(),second=h.t.repairPost();await second;assert.equal(calls,1);assert.equal(h.t.get().busy,true);release();await first;assert.equal(h.t.get().busy,false);assert.ok(h.element('repair-post-result').textContent.includes('Пост перевірено'));checks++;
+}
+{
+ const h=harness();const html=h.t.hourlyProgress({hourly:{lastSuccessAt:'2026-11-18T12:00:00Z',pendingWindows:[{discoveryLane:'context'},{discoveryLane:'context'},{discoveryLane:'evidence'}],lanes:{direct:{lastSuccessAt:'2026-11-18T12:00:00Z'},evidence:{lastSuccessAt:null},context:{lastSuccessAt:null,lastError:{code:'TIMEOUT'}}}}});
+ assert.ok(html.includes('Відмітки @entropyIO'));assert.ok(html.includes('Офіційні посилання й цитування'));assert.ok(html.includes('Entropy без відмітки'));assert.ok(html.includes('Вікон у черзі: 2'));assert.ok(html.includes('Успішна сторінка не підтверджує повноту'));assert.ok(html.includes('очікує повторної спроби'));checks++;
+}
+
+{
+ const h=harness();
+ const base={id:'untrusted-context',relevance:{version:'entropy-context-v1',status:'review',reasonCodes:['AMBIGUOUS_ENTROPY'],signals:['fake_official_domain']}};
+ assert.ok(!h.t.relevanceSummary(base).includes('Посилання на офіційний ресурс'));
+ const conflict={...base,relevance:{...base.relevance,reasonCodes:['CONFLICTING_CONTEXT'],signals:['product_context','other_project_context']}};
+ assert.ok(h.t.relevanceSummary(conflict).includes('іншого проєкту'));assert.ok(h.t.relevanceSummary(conflict).includes('ручна перевірка'));checks++;
+}
+
+{
+ const h=harness();let resolve,calls=0;
+ h.context.document.hidden=true;
+ h.context.fetch=()=>{calls++;return new Promise(done=>{resolve=done;});};
+ const initialRead=h.t.refreshBackend(true);
+ assert.equal(calls,1,'bootstrap reads even while the tab is hidden');
+ h.t.ui({search:'typed before the first response'});
+ h.context.document.activeElement={matches:()=>true};
+ const latest=snapshot(15);latest.dataset.posts.push({...latest.dataset.posts[0],id:'first-server-only-post',url:'https://x.com/example/status/9898989898989898989'});
+ resolve(response(200,latest));await initialRead;
+ assert.equal(h.t.get().backend.status,'connected');assert.equal(h.t.get().backend.revision,15);
+ assert.equal(h.t.get().dataset.posts.length,seed.posts.length+1);
+ assert.equal(h.t.get().state.ui.search,'typed before the first response');
+ assert.equal(h.t.get().serverState.ui.search,'');
+ await h.t.refreshBackend();assert.equal(calls,1,'later reads continue to respect the focused input');
+ assert.ok(readFileSync(new URL('./app.js',import.meta.url),'utf8').includes('void refreshBackend(true).catch(() => {});'));checks++;
 }
 
 console.log(checks+' focused client integration checks passed (mocked network, no browser).');
