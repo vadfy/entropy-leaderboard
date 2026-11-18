@@ -1,6 +1,6 @@
 import Model from './model.js';
 import { normalizeTweets } from './twitterapi.mjs';
-import { mergeDataset, classifySyncError } from './live-engine.mjs';
+import { mergeDataset, classifySyncError, DISCOVERY_QUERY_POLICY, DISCOVERY_LANES, discoveryQuery, discoveryTerms, normalizeDiscoveryPage, matchesDiscoveryLane } from './live-engine.mjs';
 
 const TARGET = 'entropyIO';
 const DAY = 86400000;
@@ -31,15 +31,18 @@ function validate(workbench) {
   return { dataset: Model.validateDataset(copy(workbench.dataset)),
     state: Model.validateState(copy(workbench.state || Model.initialState())), sync: copy(workbench.sync || {}) };
 }
-function window(start, endExclusive) {
-  return { start: new Date(start).toISOString(), endExclusive: new Date(endExclusive).toISOString(),
+function window(start, endExclusive, method = 'search', queryPolicy = DISCOVERY_QUERY_POLICY, discoveryLane = 'direct') {
+  const from = new Date(start).toISOString(), until = new Date(endExclusive).toISOString();
+  const filters = [DISCOVERY_QUERY_POLICY, 'original-tweets-v1'].includes(queryPolicy) ? ' -filter:replies -filter:nativeretweets' : '';
+  return { start: from, endExclusive: until, queryPolicy, discoveryLane,
+    query: method === 'id-search' ? discoveryTerms(discoveryLane, queryPolicy) + filters + ' since_id:' + idBound(start) + ' max_id:' + idBound(endExclusive) : discoveryQuery(from, until, queryPolicy, discoveryLane),
     cursor: '', previousOldest: null, seenCursors: [] };
 }
-function dailyWindows(start, end) {
+function dailyWindows(start, end, method, lanes) {
   const result = [];
   for (let point = start; point < end;) {
     const next = Math.min(end, Math.floor(point / DAY) * DAY + DAY);
-    result.push(window(point, next)); point = next;
+    for (const lane of lanes) result.push(window(point, next, method, DISCOVERY_QUERY_POLICY, lane)); point = next;
   }
   return result;
 }
@@ -56,9 +59,12 @@ function idBound(timestamp) {
 }
 
 /** Start or explicitly resume an independent, bounded history scan. No I/O. */
-export function beginBackfill(workbench, { start, endExclusive, requestLimit: limit = 250, method = 'search', now } = {}) {
+export function beginBackfill(workbench, { start, endExclusive, requestLimit: limit = 250, method = 'search', lanes, now } = {}) {
   const result = validate(workbench), nowMs = nowTime(now);
   if (!collectionMethods.has(method)) throw new Error('Invalid backfill method.');
+  const selected = lanes === undefined ? method === 'mentions' ? ['direct'] : [...DISCOVERY_LANES] : lanes;
+  if (!Array.isArray(selected) || !selected.length || selected.some(lane => !DISCOVERY_LANES.includes(lane)) || new Set(selected).size !== selected.length || method === 'mentions' && selected.some(lane => lane !== 'direct')) throw new Error('Invalid backfill lanes.');
+  const selectedLanes = DISCOVERY_LANES.filter(lane => selected.includes(lane));
   const from = Math.floor(time(start, 'start') / 1000) * 1000;
   const until = Math.floor(time(endExclusive, 'end') / 1000) * 1000;
   limit = requestLimit(limit);
@@ -67,10 +73,9 @@ export function beginBackfill(workbench, { start, endExclusive, requestLimit: li
   if (result.sync.enabled !== true) throw new Error('Enable the collector before starting a backfill.');
   if (result.sync.paused === true) throw new Error('Resume the collector before starting a backfill.');
   const startIso = new Date(from).toISOString(), endIso = new Date(until).toISOString();
-  const id = 'backfill:' + method + ':' + startIso + ':' + endIso;
+  const id = 'backfill:' + DISCOVERY_QUERY_POLICY + ':' + selectedLanes.join(',') + ':' + method + ':' + startIso + ':' + endIso;
   const existing = result.sync.backfill;
-  const legacyId = 'backfill:' + startIso + ':' + endIso;
-  if (existing && (existing.id === id || method === 'search' && existing.id === legacyId && (existing.method || 'search') === 'search')) {
+  if (existing && existing.id === id && existing.queryPolicy === DISCOVERY_QUERY_POLICY) {
     // A second start request can never erase paid progress or bypass backoff.
     if (!Number.isInteger(existing.requestCount) || existing.requestCount < 0) throw new Error('Invalid backfill checkpoint.');
     existing.method ||= 'search';
@@ -84,10 +89,10 @@ export function beginBackfill(workbench, { start, endExclusive, requestLimit: li
     return result;
   }
   if (existing && activeStatuses.has(existing.status)) throw new Error('A different backfill is already in progress.');
-  const windows = dailyWindows(from, until), at = new Date(nowMs).toISOString();
-  result.sync.backfill = { version: 1, id, method, target: TARGET, start: startIso, endExclusive: endIso,
+  const windows = dailyWindows(from, until, method, selectedLanes), at = new Date(nowMs).toISOString();
+  result.sync.backfill = { version: 3, id, method, lanes: selectedLanes, queryPolicy: DISCOVERY_QUERY_POLICY, target: TARGET, start: startIso, endExclusive: endIso,
     status: 'running', requestCount: 0, requestLimit: limit, successfulPages: 0, addedPosts: 0,
-    observedPostIds: [], measuredPages: 0, pageStatsStartedAt: null, lastPageStats: null,
+    observedPostIds: [], observedByLane: Object.fromEntries(selectedLanes.map(lane => [lane, []])), measuredPages: 0, pageStatsStartedAt: null, lastPageStats: null,
     fetchedRawTweets: 0, fetchedNormalizedNonReposts: 0, fetchedInRangeMentions: 0,
     initialWindows: windows.length, completedWindows: 0, pendingWindows: windows, completedRanges: [],
     gaps: [], splitWindows: 0, lastAttemptAt: null, lastSuccessAt: null, lastError: null,
@@ -95,48 +100,35 @@ export function beginBackfill(workbench, { start, endExclusive, requestLimit: li
   return result;
 }
 
-function directlyMentioned(tweet) {
-  return /(^|[^A-Za-z0-9_])@entropyIO(?![A-Za-z0-9_])/i.test(typeof tweet.text === 'string' ? tweet.text : '') ||
-    Array.isArray(tweet.entities?.user_mentions) && tweet.entities.user_mentions.some(m => typeof m?.screen_name === 'string' && m.screen_name.toLowerCase() === TARGET.toLowerCase());
-}
 function normalizePage(tweets, observedAt, current) {
-  const data = normalizeTweets(tweets, { observedAt, query: '@' + TARGET });
-  const normalizedNonReposts = data.posts.length;
-  const mentionIds = new Set(tweets.filter(directlyMentioned).map(t => t.id));
-  const from = Date.parse(current.start), until = Date.parse(current.endExclusive);
-  data.posts = data.posts.filter(post => mentionIds.has(post.id) && post.authorHandle.toLowerCase() !== TARGET.toLowerCase()
-    && Date.parse(post.publishedAt) >= from && Date.parse(post.publishedAt) < until);
-  const authorIds = new Set(data.posts.map(post => post.authorId));
-  data.authors = data.authors.filter(author => authorIds.has(author.id));
-  data.meta.periodStart = current.start.slice(0, 10);
-  data.meta.periodEndExclusive = new Date(Math.ceil(until / DAY) * DAY).toISOString().slice(0, 10);
-  return { data, normalizedNonReposts };
+  const raw = normalizeTweets(tweets, { observedAt, query: current.query || '@' + TARGET });
+  return { data: normalizeDiscoveryPage(tweets, observedAt, current), normalizedNonReposts: raw.posts.length };
 }
 function appendGap(sync, job, gap) {
   job.gaps.push(gap);
   sync.gaps = [...(Array.isArray(sync.gaps) ? sync.gaps : []), { ...gap, source: 'accelerated-backfill' }].slice(-50);
 }
 function missingKnownPosts(result, range, legacyOnly = false) {
-  const job = result.sync.backfill, observed = new Set(job.observedPostIds || []);
+  const job = result.sync.backfill, lane = range.discoveryLane || 'direct', observed = new Set(job.observedByLane?.[lane] || job.observedPostIds || []);
   const from = Date.parse(range.start), until = Date.parse(range.endExclusive), startedAt = Date.parse(job.startedAt);
   return result.dataset.posts.filter(post => {
     const published = Date.parse(post.publishedAt), measured = Date.parse(post.metricsAsOf);
-    return published >= from && published < until && !observed.has(post.id) &&
+    return (Model.countablePost ? Model.countablePost(post, result.state).eligible : Model.postEligibility(post).eligible && post.relevance?.status !== 'review') && published >= from && published < until && !observed.has(post.id) &&
       typeof post.authorHandle === 'string' && post.authorHandle.toLowerCase() !== TARGET.toLowerCase() &&
-      directlyMentioned({ text: post.body }) &&
+      matchesDiscoveryLane(post, lane) &&
       (!legacyOnly || !Number.isFinite(measured) || measured < startedAt);
   }).length;
 }
 function recordKnownGap(result, range, at, legacyOnly = false) {
   const { sync } = result, job = sync.backfill, count = missingKnownPosts(result, range, legacyOnly);
   if (!count) return;
-  const matches = gap => gap.code === 'KNOWN_POST_NOT_RETURNED' && gap.start === range.start && gap.endExclusive === range.endExclusive;
+  const matches = gap => gap.code === 'KNOWN_POST_NOT_RETURNED' && gap.start === range.start && gap.endExclusive === range.endExclusive && (gap.discoveryLane || 'direct') === (range.discoveryLane || 'direct');
   const existing = job.gaps.find(matches);
   if (existing) {
     existing.count = Math.max(existing.count || 0, count);
     const mirror = (sync.gaps || []).find(matches);
     if (mirror) mirror.count = existing.count;
-  } else appendGap(sync, job, { code: 'KNOWN_POST_NOT_RETURNED', count, at, start: range.start, endExclusive: range.endExclusive });
+  } else appendGap(sync, job, { code: 'KNOWN_POST_NOT_RETURNED', count, at, discoveryLane: range.discoveryLane || 'direct', start: range.start, endExclusive: range.endExclusive });
 }
 function auditCompletedKnownPosts(result, at) {
   // Older checkpoints did not retain observed IDs. Their pre-job metric
@@ -150,9 +142,9 @@ function splitOrGap(sync, job, current, code, at) {
   // are deduplicated by exact post ID by mergeDataset.
   if (until - from >= 2 * MIN_WINDOW) {
     const middle = Math.floor((from + until) / 2000) * 1000;
-    job.pendingWindows.splice(0, 1, window(from, middle), window(middle, until)); job.splitWindows++;
+    job.pendingWindows.splice(0, 1, window(from, middle, job.method || 'search', job.queryPolicy || 'legacy-unfiltered', current.discoveryLane || 'direct'), window(middle, until, job.method || 'search', job.queryPolicy || 'legacy-unfiltered', current.discoveryLane || 'direct')); job.splitWindows++;
   } else {
-    appendGap(sync, job, { code, at, start: current.start, endExclusive: current.endExclusive });
+    appendGap(sync, job, { code, at, discoveryLane: current.discoveryLane || 'direct', start: current.start, endExclusive: current.endExclusive });
     job.pendingWindows.shift();
   }
 }
@@ -171,6 +163,8 @@ function finish(result, nowMs) {
   job.finishedAt = at; job.nextAttemptAt = null;
   job.status = job.gaps.length ? 'complete-with-gaps' : 'complete';
   if (job.gaps.length) return;
+  // A completed broader-only scan is not proof of direct-mention coverage.
+  if (Array.isArray(job.lanes) && !job.lanes.includes('direct')) return;
   const from = Date.parse(job.start), until = Date.parse(job.endExclusive);
   const discovery = sync.discovery ||= { pendingWindows: [], coveredThrough: null };
   const pending = Array.isArray(discovery.pendingWindows) ? discovery.pendingWindows : [];
@@ -206,7 +200,7 @@ function failure(result, error, nowMs) {
   if (job.status === 'paused') sync.paused = true;
   const current = job.pendingWindows[0];
   if (job.lastError.diagnosticCode === 'REQUEST_TIMEOUT' && current) {
-    const key = current.start + '/' + current.endExclusive + '/' + current.cursor;
+    const key = (current.discoveryLane || 'direct') + '/' + current.start + '/' + current.endExclusive + '/' + current.cursor;
     job.consecutiveTimeouts = job.timeoutWindow === key ? (job.consecutiveTimeouts || 0) + 1 : 1;
     job.timeoutWindow = key;
     if (job.consecutiveTimeouts >= 2) {
@@ -244,15 +238,14 @@ export async function advanceBackfill(workbench, { client, now } = {}) {
   job.lastAttemptAt = at; job.requestCount++;
   sync.lastAttemptAt = at; sync.requestCount = (Number.isInteger(sync.requestCount) ? sync.requestCount : 0) + 1;
   try {
-    const query = method === 'id-search'
-      ? '@' + TARGET + ' since_id:' + idBound(from) + ' max_id:' + idBound(until)
-      : '@' + TARGET + ' since_time:' + Math.floor(from / 1000) + ' until_time:' + Math.floor(until / 1000);
+    // Cursors are scoped to the exact policy/query that created this window.
+    const query = current.query || window(from, until, method, job.queryPolicy || 'legacy-unfiltered', current.discoveryLane || 'direct').query;
     const page = method === 'mentions'
       ? await client.mentionsPage({ userName: TARGET, sinceTime: Math.floor(from / 1000), untilTime: Math.floor(until / 1000), cursor: current.cursor })
       : await client.searchPage({ query, cursor: current.cursor });
     if (!page || !Array.isArray(page.tweets) || typeof page.hasNextPage !== 'boolean') throw new Error('Invalid discovery response.');
     const times = page.tweets.map(tweet => Date.parse(tweet?.createdAt)).filter(Number.isFinite);
-    job.lastPageStats = { rawTweets: page.tweets.length, normalizedNonReposts: null, inRangeMentions: null,
+    job.lastPageStats = { discoveryLane: current.discoveryLane || 'direct', rawTweets: page.tweets.length, normalizedNonReposts: null, inRangeMentions: null,
       oldest: times.length ? new Date(Math.min(...times)).toISOString() : null,
       newest: times.length ? new Date(Math.max(...times)).toISOString() : null };
     job.measuredPages = (job.measuredPages || 0) + 1; job.pageStatsStartedAt ||= at;
@@ -270,6 +263,11 @@ export async function advanceBackfill(workbench, { client, now } = {}) {
     const empty = page.hasNextPage && !page.tweets.length;
     result.dataset = merged; result.state = migrated;
     job.observedPostIds = [...new Set([...(job.observedPostIds || []), ...incoming.posts.map(post => post.id)])];
+    if (job.queryPolicy === DISCOVERY_QUERY_POLICY) {
+      job.observedByLane ||= {};
+      const lane = current.discoveryLane || 'direct';
+      job.observedByLane[lane] = [...new Set([...(job.observedByLane[lane] || []), ...incoming.posts.map(post => post.id)])];
+    }
     job.successfulPages++; job.addedPosts += added; job.lastPageAdded = added;
     job.lastSuccessAt = at; job.lastError = null; job.consecutiveFailures = 0; job.consecutiveTimeouts = 0; job.timeoutWindow = null; job.status = 'running';
     job.nextAttemptAt = new Date(nowMs + SPACING).toISOString();
@@ -280,11 +278,14 @@ export async function advanceBackfill(workbench, { client, now } = {}) {
       current.cursor = page.nextCursor;
       current.previousOldest = times.length ? Math.min(...times) : current.previousOldest;
       current.seenCursors = [...current.seenCursors, page.nextCursor].slice(-1000);
-      job.pendingWindows[0] = current;
+      // Fair paging across query lanes prevents a noisy contextual day from
+      // consuming the whole bounded job before official-evidence windows run.
+      if ((job.lanes || []).length > 1) { job.pendingWindows.shift(); job.pendingWindows.push(current); }
+      else job.pendingWindows[0] = current;
     } else {
       recordKnownGap(result, current, at);
       job.pendingWindows.shift(); job.completedWindows++;
-      job.completedRanges.push({ start: current.start, endExclusive: current.endExclusive });
+      job.completedRanges.push({ start: current.start, endExclusive: current.endExclusive, discoveryLane: current.discoveryLane || 'direct' });
     }
     if (!job.pendingWindows.length) finish(result, nowMs);
     else if (job.requestCount >= job.requestLimit) { job.status = 'request-limit'; job.nextAttemptAt = null; }
