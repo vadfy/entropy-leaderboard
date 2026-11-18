@@ -43,7 +43,7 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const payload = await body(request);
-    if (payload.action === 'start' && Object.keys(payload).every(key => ['action', 'start', 'endExclusive', 'requestLimit', 'method'].includes(key))) return response(summary(await startBackfill(payload)));
+    if (payload.action === 'start' && Object.keys(payload).every(key => ['action', 'start', 'endExclusive', 'requestLimit', 'method', 'lanes'].includes(key))) return response(summary(await startBackfill(payload)));
     if (payload.action === 'cancel' && Object.keys(payload).every(key => ['action', 'expectedRevision'].includes(key))) return response(summary(await cancelBackfill(payload.expectedRevision)));
     if (payload.action === 'step' && Object.keys(payload).length === 1) return response(summary(await runBackfill()));
     throw new WorkbenchError(400, 'INVALID_INPUT', 'Use a bounded start request, cancel, or one step action.');
